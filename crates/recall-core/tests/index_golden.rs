@@ -79,6 +79,45 @@ fn reindex_is_idempotent_no_duplicates() {
 }
 
 #[test]
+fn recover_surfaces_pre_compaction_history() {
+    use recall_core::recover::{recover_session, Item};
+
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+    let sess = store
+        .find_sessions("basic_session", 5)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let rec = recover_session(&store, sess.pk).unwrap();
+    assert_eq!(rec.boundary_count, 1, "fixture has one compaction boundary");
+    assert_eq!(
+        rec.recovered_count, 5,
+        "5 message rows precede the boundary"
+    );
+
+    // The pre-compaction assistant turn must be recovered AND flagged as hidden.
+    let has_flagged_pre = rec.items.iter().any(|it| {
+        matches!(it, Item::Message(m)
+            if m.pre_compaction && m.row.content_json.contains("Clip the gradients"))
+    });
+    assert!(
+        has_flagged_pre,
+        "pre-compaction content must be recovered + flagged"
+    );
+
+    // There is a boundary marker, and at least one post-compaction (unflagged) msg.
+    assert!(rec.items.iter().any(|it| matches!(it, Item::Boundary(_))));
+    assert!(rec
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Message(m) if !m.pre_compaction)));
+}
+
+#[test]
 fn name_makes_session_findable_by_alias() {
     let (_guard, projects) = temp_projects();
     let mut store = Store::open_in_memory().unwrap();

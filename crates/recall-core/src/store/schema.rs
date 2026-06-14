@@ -36,6 +36,7 @@ CREATE INDEX idx_messages_parent_uuid ON messages(parent_uuid);
 CREATE TABLE boundaries(
   id INTEGER PRIMARY KEY,
   session_fk INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+  line_no INTEGER,
   uuid TEXT, parent_uuid TEXT, logical_parent_uuid TEXT, logical_parent_file TEXT,
   trigger TEXT, pre_tokens INTEGER, post_tokens INTEGER, ts INTEGER);
 CREATE INDEX idx_boundaries_session ON boundaries(session_fk);

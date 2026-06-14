@@ -18,9 +18,12 @@ fn render_block(b: &Block, out: &mut String) {
             out.push('\n');
         }
         Block::Thinking { text } => {
-            out.push_str("  💭 ");
-            out.push_str(&truncate(text, 200));
-            out.push('\n');
+            let t = truncate(text, 200);
+            if !t.is_empty() {
+                out.push_str("  💭 ");
+                out.push_str(&t);
+                out.push('\n');
+            }
         }
         Block::ToolUse { name, input, .. } => {
             out.push_str(&format!("  → {name}({})\n", summarize_input(input)));

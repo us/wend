@@ -103,46 +103,86 @@ fn run(args: Cli) -> Result<()> {
             head,
             tail,
         } => {
-            if recovered {
-                tracing::warn!("--recovered not yet implemented (S4); showing stored transcript");
-            }
             let store = open_store()?;
             let sess = resolve_or_report(&store, &id)?;
-            let msgs = store.session_messages(sess.pk)?;
 
-            // Render only the visible messages (those with non-empty body).
-            let mut visible: Vec<(String, String)> = Vec::new();
-            for m in &msgs {
-                let blocks: Vec<Block> = serde_json::from_str(&m.content_json).unwrap_or_default();
-                let body = render::render_blocks(&blocks);
-                if body.trim().is_empty() {
-                    continue; // skip empty graph nodes (system/progress/etc.)
+            // Build printable chunks. With --recovered we interleave boundary
+            // markers and flag the pre-compaction history the live UI hides.
+            let mut chunks: Vec<String> = Vec::new();
+            let mut header_extra: Option<String> = None;
+            if recovered {
+                let rec = recall_core::recover::recover_session(&store, sess.pk)?;
+                let mut h = format!(
+                    "  recovered: {} pre-compaction message(s) across {} boundary(ies) hidden by the live UI",
+                    rec.recovered_count, rec.boundary_count
+                );
+                if rec.cross_file_boundaries > 0 {
+                    h.push_str(&format!(
+                        "\n  note: {} boundary(ies) continue from another session file — that earliest history isn't included here",
+                        rec.cross_file_boundaries
+                    ));
                 }
-                let who = m.role.clone().unwrap_or_else(|| m.rec_type.clone());
-                visible.push((who, body));
+                header_extra = Some(h);
+                for item in &rec.items {
+                    match item {
+                        recall_core::recover::Item::Boundary(b) => {
+                            chunks.push(format!(
+                                "─── ⟪ compaction boundary · {} · {}→{} tokens ⟫ ───",
+                                b.trigger.as_deref().unwrap_or("?"),
+                                opt_num(b.pre_tokens),
+                                opt_num(b.post_tokens),
+                            ));
+                        }
+                        recall_core::recover::Item::Message(rm) => {
+                            if let Some(chunk) = render_message_chunk(
+                                &rm.row.content_json,
+                                &rm.row.role,
+                                &rm.row.rec_type,
+                                rm.pre_compaction,
+                            ) {
+                                chunks.push(chunk);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for m in &store.session_messages(sess.pk)? {
+                    if let Some(chunk) =
+                        render_message_chunk(&m.content_json, &m.role, &m.rec_type, false)
+                    {
+                        chunks.push(chunk);
+                    }
+                }
             }
 
             // Window: explicit --head/--tail, else a soft default cap so a huge
             // session doesn't dump tens of thousands of lines.
             const DEFAULT_CAP: usize = 200;
-            let total = visible.len();
+            let total = chunks.len();
             let mut note: Option<(&str, usize)> = None;
-            let slice: &[(String, String)] = match (head, tail) {
+            let slice: &[String] = match (head, tail) {
                 (Some(n), _) => {
                     let n = n.min(total);
                     note = Some(("first", n));
-                    &visible[..n]
+                    &chunks[..n]
                 }
                 (None, Some(n)) => {
                     let n = n.min(total);
                     note = Some(("last", n));
-                    &visible[total - n..]
+                    &chunks[total - n..]
                 }
                 (None, None) if total > DEFAULT_CAP => {
-                    note = Some(("last", DEFAULT_CAP));
-                    &visible[total - DEFAULT_CAP..]
+                    // With --recovered the user wants the hidden *early* history,
+                    // so default to the start; otherwise show the most recent.
+                    if recovered {
+                        note = Some(("first", DEFAULT_CAP));
+                        &chunks[..DEFAULT_CAP]
+                    } else {
+                        note = Some(("last", DEFAULT_CAP));
+                        &chunks[total - DEFAULT_CAP..]
+                    }
                 }
-                (None, None) => &visible[..],
+                (None, None) => &chunks[..],
             };
 
             let title = if sess.title.is_empty() {
@@ -154,14 +194,16 @@ fn run(args: Cli) -> Result<()> {
             if let Some(p) = &sess.project_path {
                 println!("  project: {p}");
             }
+            if let Some(h) = header_extra {
+                println!("{h}");
+            }
             if let Some((which, n)) = note {
                 println!(
-                    "  showing {which} {n} of {total} messages (use --head/--tail, or `export` for the full transcript)"
+                    "  showing {which} {n} of {total} blocks (use --head/--tail, or `export` for the full transcript)"
                 );
             }
-            for (who, body) in slice {
-                println!("\n## {who}");
-                print!("{body}");
+            for c in slice {
+                println!("\n{c}");
             }
             Ok(())
         }
@@ -231,6 +273,32 @@ fn resolve_or_report(store: &Store, id: &str) -> Result<SessionRef> {
 
 fn short(session_id: &str) -> &str {
     &session_id[..session_id.len().min(8)]
+}
+
+/// Render one stored message into a printable chunk, or `None` if it has no
+/// visible body (empty graph nodes like system/progress).
+fn render_message_chunk(
+    content_json: &str,
+    role: &Option<String>,
+    rec_type: &str,
+    pre_compaction: bool,
+) -> Option<String> {
+    let blocks: Vec<Block> = serde_json::from_str(content_json).unwrap_or_default();
+    let body = render::render_blocks(&blocks);
+    if body.trim().is_empty() {
+        return None;
+    }
+    let who = role.clone().unwrap_or_else(|| rec_type.to_string());
+    let tag = if pre_compaction {
+        "  ⟨pre-compaction · hidden by UI⟩"
+    } else {
+        ""
+    };
+    Some(format!("## {who}{tag}\n{}", body.trim_end()))
+}
+
+fn opt_num(n: Option<i64>) -> String {
+    n.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string())
 }
 
 /// Minimal shell quoting for the emitted `cd` command.

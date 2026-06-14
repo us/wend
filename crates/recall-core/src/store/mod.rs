@@ -50,6 +50,16 @@ pub struct MessageRow {
     pub content_json: String,
 }
 
+/// A stored compaction-boundary row, for recovery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundaryRow {
+    pub line_no: i64,
+    pub trigger: Option<String>,
+    pub pre_tokens: Option<i64>,
+    pub post_tokens: Option<i64>,
+    pub logical_parent_uuid: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -174,13 +184,14 @@ impl Store {
         }
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO boundaries(session_fk, uuid, parent_uuid, logical_parent_uuid,
+                "INSERT INTO boundaries(session_fk, line_no, uuid, parent_uuid, logical_parent_uuid,
                     logical_parent_file, trigger, pre_tokens, post_tokens, ts)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             )?;
             for b in &s.boundaries {
                 stmt.execute(params![
                     session_fk,
+                    b.line_no as i64,
                     b.uuid,
                     b.parent_uuid,
                     b.logical_parent_uuid,
@@ -358,6 +369,45 @@ impl Store {
                 role: r.get(2)?,
                 ts: r.get(3)?,
                 content_json: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// All message uuids for a session (used by recovery to detect cross-file
+    /// boundaries — a `logical_parent_uuid` not present here lives in another file).
+    pub fn session_message_uuids(
+        &self,
+        session_pk: i64,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uuid FROM messages WHERE session_fk=?1 AND uuid IS NOT NULL")?;
+        let rows = stmt.query_map(params![session_pk], |r| r.get::<_, String>(0))?;
+        let mut set = std::collections::HashSet::new();
+        for r in rows {
+            set.insert(r?);
+        }
+        Ok(set)
+    }
+
+    /// Load a session's compaction boundaries in line order (for recovery).
+    pub fn session_boundaries(&self, session_pk: i64) -> Result<Vec<BoundaryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT line_no, trigger, pre_tokens, post_tokens, logical_parent_uuid
+             FROM boundaries WHERE session_fk=?1 ORDER BY line_no",
+        )?;
+        let rows = stmt.query_map(params![session_pk], |r| {
+            Ok(BoundaryRow {
+                line_no: r.get(0)?,
+                trigger: r.get(1)?,
+                pre_tokens: r.get(2)?,
+                post_tokens: r.get(3)?,
+                logical_parent_uuid: r.get(4)?,
             })
         })?;
         let mut out = Vec::new();
