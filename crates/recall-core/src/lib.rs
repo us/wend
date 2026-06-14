@@ -5,6 +5,8 @@
 //! and never writes to stdout — that is the CLI's job.
 
 pub mod error;
+pub mod model;
+pub mod parser;
 
 pub use error::{Error, Result};
 

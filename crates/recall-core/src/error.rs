@@ -11,14 +11,6 @@ pub enum Error {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("json parse error at {path}:{line}: {source}")]
-    Json {
-        path: String,
-        line: usize,
-        #[source]
-        source: serde_json::Error,
-    },
-
     #[error("invalid session data: {0}")]
     InvalidData(String),
 
