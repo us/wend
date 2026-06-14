@@ -45,8 +45,10 @@ pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>
     }
 
     // Over-fetch body hits so a common term still yields enough distinct
-    // sessions after dedup, but cap the raw pull.
-    let raw_limit = (limit.saturating_mul(20)).clamp(limit, 10_000);
+    // sessions after dedup, but cap the raw pull. Must stay >= `limit` and never
+    // let min>max (a `clamp(limit, CAP)` panics when limit>CAP).
+    const RAW_CAP: usize = 50_000;
+    let raw_limit = limit.saturating_mul(20).max(limit).min(RAW_CAP);
     for hit in store.search_raw(&match_query, raw_limit)? {
         if seen.insert(hit.session_id.clone()) {
             grouped.push(hit);

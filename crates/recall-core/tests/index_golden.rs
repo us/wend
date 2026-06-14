@@ -181,6 +181,44 @@ fn reindex_after_mutation_leaves_no_orphans() {
 }
 
 #[test]
+fn huge_limit_does_not_panic() {
+    // Regression: search --limit above the internal raw cap used to panic
+    // (clamp(min=limit, max=CAP) with min>max).
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+    let hits = search(&store, "gradient", 10_000_000).unwrap();
+    assert!(hits.len() <= 1, "only one session in the fixture");
+}
+
+#[test]
+fn alias_survives_full_reindex() {
+    // Regression: a user alias (custom_title) lives only in the DB; a full
+    // `index` (DELETE+reinsert) used to wipe it. It must be preserved.
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+    let sess = store
+        .find_sessions("basic_session", 5)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    store
+        .set_custom_title(sess.pk, "keepme-alias-token")
+        .unwrap();
+    assert!(!search(&store, "keepme-alias-token", 5).unwrap().is_empty());
+
+    // FULL reindex (not incremental) must NOT wipe the alias.
+    index_all(&mut store, &projects, false).unwrap();
+    let hits = search(&store, "keepme-alias-token", 5).unwrap();
+    assert!(
+        hits.iter().any(|h| h.session_id == "basic_session"),
+        "alias must survive a full re-index"
+    );
+}
+
+#[test]
 fn incremental_skips_unchanged_files() {
     let (_guard, projects) = temp_projects();
     let mut store = Store::open_in_memory().unwrap();

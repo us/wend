@@ -8,7 +8,7 @@ pub mod schema;
 
 use crate::error::Result;
 use crate::index::AssembledSession;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -122,6 +122,23 @@ impl Store {
 
         // CASCADE clears messages/boundaries/boundary_messages/workflows/worktrees;
         // FTS triggers fire on the cascaded message deletes. relations has no FK.
+        // Preserve a user-set alias (custom_title) across a full re-index — it
+        // lives only in the DB, not in the .jsonl, so a plain DELETE+reinsert
+        // would otherwise wipe it (data-loss footgun).
+        let existing_custom: Option<String> = tx
+            .query_row(
+                "SELECT custom_title FROM sessions WHERE file_path=?1",
+                params![s.file_path],
+                |r| r.get::<_, Option<String>>(0), // column is nullable
+            )
+            .optional()? // None when no prior row
+            .flatten(); // collapse no-row / NULL-value into None
+        let custom_title = s.custom_title.clone().or(existing_custom);
+        let title = custom_title
+            .clone()
+            .or_else(|| s.ai_title.clone())
+            .unwrap_or_default();
+
         tx.execute(
             "DELETE FROM sessions WHERE file_path=?1",
             params![s.file_path],
@@ -146,8 +163,8 @@ impl Store {
                 s.first_ts,
                 s.last_ts,
                 s.ai_title,
-                s.custom_title,
-                s.title,
+                custom_title,
+                title,
                 s.messages.len() as i64,
                 s.has_compaction as i64,
                 now

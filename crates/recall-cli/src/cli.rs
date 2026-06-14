@@ -29,11 +29,11 @@ pub enum Command {
         #[arg(long)]
         embed: bool,
     },
-    /// Search past sessions by keyword (and, with --semantic, meaning).
+    /// Search past sessions by keyword.
     Search {
         /// Free-text query.
         query: String,
-        /// Use hybrid keyword + semantic search.
+        /// Hybrid keyword + semantic search (not implemented yet; falls back to keyword).
         #[arg(long)]
         semantic: bool,
         /// Emit machine-readable JSON (for the skill).

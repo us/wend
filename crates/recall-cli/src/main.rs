@@ -66,7 +66,11 @@ fn run(args: Cli) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string(&hits)?);
             } else if hits.is_empty() {
-                println!("no matches for {query:?}");
+                if store.session_count().unwrap_or(0) == 0 {
+                    println!("index is empty — run `recall index` first");
+                } else {
+                    println!("no matches for {query:?}");
+                }
             } else {
                 for (i, h) in hits.iter().enumerate() {
                     let title = if h.title.is_empty() {
@@ -212,11 +216,18 @@ fn run(args: Cli) -> Result<()> {
             let store = open_store()?;
             let sess = resolve_or_report(&store, &id)?;
             match &sess.project_path {
-                Some(cwd) => println!(
-                    "cd {} && claude --resume {}",
-                    shell_quote(cwd),
-                    sess.session_id
-                ),
+                Some(cwd) => {
+                    if !std::path::Path::new(cwd).is_dir() {
+                        eprintln!(
+                            "warning: project dir no longer exists: {cwd} (the cd will fail — resume manually from another dir if needed)"
+                        );
+                    }
+                    println!(
+                        "cd {} && claude --resume {}",
+                        shell_quote(cwd),
+                        sess.session_id
+                    );
+                }
                 None => println!("claude --resume {}", sess.session_id),
             }
             Ok(())
@@ -233,7 +244,16 @@ fn run(args: Cli) -> Result<()> {
             Ok(())
         }
 
-        other => anyhow::bail!("command not yet implemented: {other:?}"),
+        Command::Tree { .. } => {
+            anyhow::bail!(
+                "`tree` (worktree/subagent topology) is not implemented yet — coming in a later version"
+            )
+        }
+        Command::Export { .. } => {
+            anyhow::bail!(
+                "`export` is not implemented yet — use `recall show <id>` to read a transcript for now"
+            )
+        }
     }
 }
 
