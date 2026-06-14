@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+# Never commit exported transcripts (may contain recovered secrets) or local index/cache
+*.recall-export.*
+/exports/
+.DS_Store
