@@ -181,6 +181,35 @@ fn reindex_after_mutation_leaves_no_orphans() {
 }
 
 #[test]
+fn topology_groups_worktree_sessions() {
+    use recall_core::topology::{build, Confidence};
+
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+
+    let topo = build(&store, None).unwrap();
+    assert_eq!(topo.projects.len(), 1, "one repo");
+    let proj = &topo.projects[0];
+    assert_eq!(proj.repo, "/Users/dev/proj");
+
+    // The fixture session carries a worktree-state record (worktree "exp"),
+    // so it groups under that worktree, not as a main session.
+    assert_eq!(proj.worktrees.len(), 1);
+    let wt = &proj.worktrees[0];
+    assert_eq!(wt.name, "exp");
+    assert_eq!(wt.confidence, Confidence::Explicit);
+    assert_eq!(wt.branch.as_deref(), Some("exp"));
+    assert_eq!(wt.sessions.len(), 1);
+
+    // Filter that matches nothing → empty topology.
+    assert!(build(&store, Some("nonexistent-xyz"))
+        .unwrap()
+        .projects
+        .is_empty());
+}
+
+#[test]
 fn huge_limit_does_not_panic() {
     // Regression: search --limit above the internal raw cap used to panic
     // (clamp(min=limit, max=CAP) with min>max).

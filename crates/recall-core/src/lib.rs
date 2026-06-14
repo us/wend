@@ -12,6 +12,7 @@ pub mod parser;
 pub mod recover;
 pub mod search;
 pub mod store;
+pub mod topology;
 
 pub use error::{Error, Result};
 

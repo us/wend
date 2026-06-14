@@ -50,6 +50,28 @@ pub struct MessageRow {
     pub content_json: String,
 }
 
+/// A lightweight session summary, for the topology view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionBrief {
+    pub pk: i64,
+    pub session_id: String,
+    pub project_path: Option<String>,
+    pub project_name: Option<String>,
+    pub title: String,
+    pub last_ts: Option<i64>,
+    pub message_count: i64,
+}
+
+/// A worktree-state record linking a session to its origin repo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorktreeInfo {
+    pub session_pk: i64,
+    pub original_cwd: Option<String>,
+    pub worktree_name: Option<String>,
+    pub branch: Option<String>,
+    pub continues_session_id: Option<String>,
+}
+
 /// A stored compaction-boundary row, for recovery.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundaryRow {
@@ -410,6 +432,53 @@ impl Store {
             set.insert(r?);
         }
         Ok(set)
+    }
+
+    /// All sessions as lightweight summaries (most recent first) for topology.
+    pub fn all_sessions(&self) -> Result<Vec<SessionBrief>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, project_path, project_name, COALESCE(title,''),
+                    last_ts, COALESCE(message_count,0)
+             FROM sessions ORDER BY last_ts DESC NULLS LAST",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SessionBrief {
+                pk: r.get(0)?,
+                session_id: r.get(1)?,
+                project_path: r.get(2)?,
+                project_name: r.get(3)?,
+                title: r.get(4)?,
+                last_ts: r.get(5)?,
+                message_count: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// All worktree-state records (one or more per worktree session).
+    pub fn all_worktrees(&self) -> Result<Vec<WorktreeInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_fk, original_cwd, worktree_name, branch, continues_session_id
+             FROM worktrees",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(WorktreeInfo {
+                session_pk: r.get(0)?,
+                original_cwd: r.get(1)?,
+                worktree_name: r.get(2)?,
+                branch: r.get(3)?,
+                continues_session_id: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Load a session's compaction boundaries in line order (for recovery).

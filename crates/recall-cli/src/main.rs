@@ -244,10 +244,51 @@ fn run(args: Cli) -> Result<()> {
             Ok(())
         }
 
-        Command::Tree { .. } => {
-            anyhow::bail!(
-                "`tree` (worktree/subagent topology) is not implemented yet — coming in a later version"
-            )
+        Command::Tree { project } => {
+            use recall_core::topology::{self, Confidence};
+            let store = open_store()?;
+            let topo = topology::build(&store, project.as_deref())?;
+            if topo.projects.is_empty() {
+                match &project {
+                    Some(p) => println!("no sessions match {p:?}"),
+                    None => println!("no sessions indexed — run `recall index`"),
+                }
+                return Ok(());
+            }
+            for proj in &topo.projects {
+                let n: usize = proj.main_sessions.len()
+                    + proj
+                        .worktrees
+                        .iter()
+                        .map(|w| w.sessions.len())
+                        .sum::<usize>();
+                println!("\n{}  ({n} session(s))", proj.repo);
+                for s in &proj.main_sessions {
+                    println!(
+                        "  ├─ {}  {}  · {} msgs",
+                        short(&s.session_id),
+                        title_or(&s.title),
+                        s.message_count
+                    );
+                }
+                for w in &proj.worktrees {
+                    let conf = match w.confidence {
+                        Confidence::Explicit => "explicit",
+                        Confidence::Inferred => "inferred",
+                    };
+                    let branch = w.branch.as_deref().unwrap_or("?");
+                    println!("  ├─ ⌥ worktree: {} (branch {branch}) [{conf}]", w.name);
+                    for s in &w.sessions {
+                        println!(
+                            "  │    └─ {}  {}  · {} msgs",
+                            short(&s.session_id),
+                            title_or(&s.title),
+                            s.message_count
+                        );
+                    }
+                }
+            }
+            Ok(())
         }
         Command::Export { .. } => {
             anyhow::bail!(
@@ -293,6 +334,14 @@ fn resolve_or_report(store: &Store, id: &str) -> Result<SessionRef> {
 
 fn short(session_id: &str) -> &str {
     &session_id[..session_id.len().min(8)]
+}
+
+fn title_or(t: &str) -> &str {
+    if t.is_empty() {
+        "(untitled)"
+    } else {
+        t
+    }
 }
 
 /// Render one stored message into a printable chunk, or `None` if it has no
