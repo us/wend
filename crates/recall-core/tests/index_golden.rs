@@ -1,0 +1,124 @@
+//! Integration test: index the fixture corpus into a temp DB and assert counts,
+//! idempotency (no duplicates on re-index), and that keyword search works.
+//! Hermetic — uses a tempdir, never `~/.claude`.
+
+use recall_core::index::index_all;
+use recall_core::search::search;
+use recall_core::store::Store;
+use std::path::PathBuf;
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .join(name)
+}
+
+/// Build a temp `projects/<encoded>/<session>.jsonl` tree from a fixture.
+fn temp_projects() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    let proj = projects.join("-Users-dev-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::copy(
+        fixture("basic_session.jsonl"),
+        proj.join("basic_session.jsonl"),
+    )
+    .unwrap();
+    (dir, projects)
+}
+
+#[test]
+fn indexes_fixture_and_search_finds_it() {
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+
+    let stats = index_all(&mut store, &projects, false).unwrap();
+    assert_eq!(stats.files_seen, 1);
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(store.session_count().unwrap(), 1);
+    assert_eq!(
+        store.message_count().unwrap(),
+        7,
+        "7 graph nodes from the fixture"
+    );
+
+    // keyword search hits the indexed content
+    let hits = search(&store, "gradient", 10).unwrap();
+    assert!(!hits.is_empty(), "expected a match for 'gradient'");
+    assert!(hits.iter().any(|h| h.session_id == "basic_session"));
+
+    // thinking text must not be searchable
+    let secret = search(&store, "private reasoning", 10).unwrap();
+    assert!(secret.is_empty(), "thinking blocks must not be indexed");
+}
+
+#[test]
+fn reindex_is_idempotent_no_duplicates() {
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+
+    index_all(&mut store, &projects, false).unwrap();
+    let sessions_after_first = store.session_count().unwrap();
+    let messages_after_first = store.message_count().unwrap();
+
+    // Full re-index 2 more times → counts must not grow (per-file replacement).
+    index_all(&mut store, &projects, false).unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+    assert_eq!(store.session_count().unwrap(), sessions_after_first);
+    assert_eq!(store.message_count().unwrap(), messages_after_first);
+
+    // Search still returns exactly one session (no duplicate rows).
+    let hits = search(&store, "gradient", 50).unwrap();
+    let distinct_sessions: std::collections::HashSet<_> =
+        hits.iter().map(|h| h.session_id.clone()).collect();
+    assert_eq!(distinct_sessions.len(), 1);
+
+    // No orphans, FTS consistent.
+    assert_eq!(store.foreign_key_violations().unwrap(), 0);
+    store.fts_integrity_check().unwrap();
+}
+
+#[test]
+fn reindex_after_mutation_leaves_no_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    let proj = projects.join("-Users-dev-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let file = proj.join("s.jsonl");
+    std::fs::copy(fixture("basic_session.jsonl"), &file).unwrap();
+
+    let mut store = Store::open_in_memory().unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+    assert!(!search(&store, "gradient", 10).unwrap().is_empty());
+
+    // Mutate: replace the file with a tiny 2-message session.
+    std::fs::write(
+        &file,
+        "{\"type\":\"user\",\"uuid\":\"x1\",\"parentUuid\":null,\"message\":{\"role\":\"user\",\"content\":\"totally different topic\"}}\n\
+         {\"type\":\"assistant\",\"uuid\":\"x2\",\"parentUuid\":\"x1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n",
+    )
+    .unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+
+    assert_eq!(store.session_count().unwrap(), 1);
+    assert_eq!(store.message_count().unwrap(), 2, "old messages gone");
+    // Old content no longer searchable → no orphan FTS rows.
+    assert!(search(&store, "gradient", 10).unwrap().is_empty());
+    assert!(!search(&store, "different topic", 10).unwrap().is_empty());
+    assert_eq!(store.foreign_key_violations().unwrap(), 0);
+    store.fts_integrity_check().unwrap();
+}
+
+#[test]
+fn incremental_skips_unchanged_files() {
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+
+    let first = index_all(&mut store, &projects, true).unwrap();
+    assert_eq!(first.indexed, 1);
+    assert_eq!(first.skipped_unchanged, 0);
+
+    let second = index_all(&mut store, &projects, true).unwrap();
+    assert_eq!(second.indexed, 0, "unchanged file must be skipped");
+    assert_eq!(second.skipped_unchanged, 1);
+}

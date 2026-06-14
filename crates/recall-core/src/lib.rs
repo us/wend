@@ -4,9 +4,13 @@
 //! compaction-recovery, and worktree/subagent topology. This crate is UI-free
 //! and never writes to stdout — that is the CLI's job.
 
+pub mod config;
 pub mod error;
+pub mod index;
 pub mod model;
 pub mod parser;
+pub mod search;
+pub mod store;
 
 pub use error::{Error, Result};
 

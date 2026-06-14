@@ -12,4 +12,10 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+rusqlite.workspace = true
+etcetera.workspace = true
+rayon.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

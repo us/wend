@@ -11,6 +11,9 @@ pub enum Error {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("database error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
     #[error("invalid session data: {0}")]
     InvalidData(String),
 
