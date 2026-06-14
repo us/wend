@@ -31,6 +31,25 @@ pub struct FileStat {
     pub size: i64,
 }
 
+/// A resolved session reference (for show/resume/name/export).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRef {
+    pub pk: i64,
+    pub session_id: String,
+    pub project_path: Option<String>,
+    pub title: String,
+}
+
+/// A stored message row, for rendering a transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageRow {
+    pub line_no: i64,
+    pub rec_type: String,
+    pub role: Option<String>,
+    pub ts: Option<i64>,
+    pub content_json: String,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -265,19 +284,115 @@ impl Store {
         Ok(())
     }
 
-    /// Keyword search over message bodies. `match_query` must already be a valid
-    /// FTS5 query string (use [`crate::search::compile_query`]).
+    /// Find sessions whose id starts with `id_prefix` (most recent first).
+    /// Returns up to `limit` candidates so the caller can disambiguate.
+    pub fn find_sessions(&self, id_prefix: &str, limit: usize) -> Result<Vec<SessionRef>> {
+        // Escape LIKE metacharacters so `_`/`%` in the prefix are literals; the
+        // trailing `%` is our wildcard. Explicit ESCAPE keeps it correct.
+        let escaped = id_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, project_path, COALESCE(title,'')
+             FROM sessions WHERE session_id LIKE ?1 ESCAPE '\\'
+             ORDER BY last_ts DESC NULLS LAST LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |r| {
+            Ok(SessionRef {
+                pk: r.get(0)?,
+                session_id: r.get(1)?,
+                project_path: r.get(2)?,
+                title: r.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Raw title/alias search over `sessions_fts` (best-first). One row per
+    /// session already (titles are session-level). `line_no` is 0.
+    pub fn search_titles_raw(&self, match_query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''),
+                    0 AS line_no,
+                    snippet(sessions_fts, 0, '[', ']', '…', 12),
+                    bm25(sessions_fts) AS rank
+             FROM sessions_fts
+             JOIN sessions s ON s.id = sessions_fts.rowid
+             WHERE sessions_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![match_query, limit as i64], |r| {
+            Ok(SearchHit {
+                session_id: r.get(0)?,
+                title: r.get(1)?,
+                project: r.get(2)?,
+                line_no: r.get(3)?,
+                snippet: r.get(4)?,
+                rank: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Load a session's messages in line order (for `show`/`export`).
+    pub fn session_messages(&self, session_pk: i64) -> Result<Vec<MessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT line_no, type, role, ts, COALESCE(content_json,'[]')
+             FROM messages WHERE session_fk=?1 ORDER BY line_no",
+        )?;
+        let rows = stmt.query_map(params![session_pk], |r| {
+            Ok(MessageRow {
+                line_no: r.get(0)?,
+                rec_type: r.get(1)?,
+                role: r.get(2)?,
+                ts: r.get(3)?,
+                content_json: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Set a user alias (custom title). The `sessions_au` trigger keeps the FTS
+    /// title index in sync.
+    pub fn set_custom_title(&mut self, session_pk: i64, alias: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET custom_title=?2, title=?2 WHERE id=?1",
+            params![session_pk, alias],
+        )?;
+        Ok(())
+    }
+
+    /// Raw keyword search: message-level hits ordered best-first (bm25 asc).
+    /// `match_query` must already be a valid FTS5 query string (use
+    /// [`crate::search::compile_query`]). Grouping to one-per-session happens in
+    /// [`crate::search::search`] — FTS5 aux functions can't be nested in SQL
+    /// aggregates, so dedup is done in Rust over this ordered stream.
     pub fn search_raw(&self, match_query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''),
                     m.line_no,
                     snippet(messages_fts, 0, '[', ']', '…', 12),
-                    bm25(messages_fts)
+                    bm25(messages_fts) AS rank
              FROM messages_fts
              JOIN messages m ON m.id = messages_fts.rowid
              JOIN sessions s ON s.id = m.session_fk
              WHERE messages_fts MATCH ?1
-             ORDER BY bm25(messages_fts)
+             ORDER BY rank
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![match_query, limit as i64], |r| {

@@ -50,6 +50,12 @@ pub enum Command {
         /// Reconstruct and include pre-compaction history.
         #[arg(long)]
         recovered: bool,
+        /// Show only the first N visible messages.
+        #[arg(long)]
+        head: Option<usize>,
+        /// Show only the last N visible messages.
+        #[arg(long)]
+        tail: Option<usize>,
     },
     /// Show the worktree/subagent topology for a project.
     Tree {

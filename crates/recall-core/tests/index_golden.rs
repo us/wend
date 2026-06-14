@@ -79,6 +79,38 @@ fn reindex_is_idempotent_no_duplicates() {
 }
 
 #[test]
+fn name_makes_session_findable_by_alias() {
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+
+    let sess = store
+        .find_sessions("basic_session", 5)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("fixture session indexed");
+
+    // A token that appears nowhere in the fixture's message content.
+    let alias = "qqzz-unique-alias-token";
+    assert!(
+        search(&store, alias, 5).unwrap().is_empty(),
+        "precondition: alias token must not exist in message bodies"
+    );
+
+    store.set_custom_title(sess.pk, alias).unwrap();
+
+    let hits = search(&store, alias, 5).unwrap();
+    assert!(
+        hits.iter().any(|h| h.session_id == "basic_session"),
+        "after naming, the session must be findable by its alias (title search)"
+    );
+    // FK + FTS stay consistent after the title update.
+    assert_eq!(store.foreign_key_violations().unwrap(), 0);
+    store.fts_integrity_check().unwrap();
+}
+
+#[test]
 fn reindex_after_mutation_leaves_no_orphans() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");

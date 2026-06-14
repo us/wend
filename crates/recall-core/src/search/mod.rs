@@ -22,12 +22,40 @@ pub fn compile_query(input: &str) -> Option<String> {
     }
 }
 
-/// Run a keyword search. Returns an empty result for an empty query.
+/// Run a keyword search, returning at most `limit` results — **one per session**
+/// (the best-matching message). Returns empty for an empty query.
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-    match compile_query(query) {
-        Some(match_query) => store.search_raw(&match_query, limit),
-        None => Ok(Vec::new()),
+    let Some(match_query) = compile_query(query) else {
+        return Ok(Vec::new());
+    };
+    // Tiered merge (corpus-size-independent): title/alias matches first — that's
+    // a strong signal and `name`'s whole purpose — then message-body matches,
+    // best-first. Dedup to one result per session. (A fixed additive bm25 boost
+    // is fragile because body/title bm25 scales diverge as the corpus grows.)
+    let mut seen = std::collections::HashSet::new();
+    let mut grouped = Vec::with_capacity(limit);
+
+    for hit in store.search_titles_raw(&match_query, limit)? {
+        if seen.insert(hit.session_id.clone()) {
+            grouped.push(hit);
+            if grouped.len() >= limit {
+                return Ok(grouped);
+            }
+        }
     }
+
+    // Over-fetch body hits so a common term still yields enough distinct
+    // sessions after dedup, but cap the raw pull.
+    let raw_limit = (limit.saturating_mul(20)).clamp(limit, 10_000);
+    for hit in store.search_raw(&match_query, raw_limit)? {
+        if seen.insert(hit.session_id.clone()) {
+            grouped.push(hit);
+            if grouped.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(grouped)
 }
 
 #[cfg(test)]
