@@ -17,5 +17,22 @@ etcetera.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 
+# Optional: local semantic search (pure-Rust Candle embeddings). Opt-in because
+# it's heavy (model download, larger binary) and the keyword core needs none of it.
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+tokenizers = { version = "0.23", optional = true }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
+
+[features]
+semantic = [
+  "dep:candle-core",
+  "dep:candle-nn",
+  "dep:candle-transformers",
+  "dep:tokenizers",
+  "dep:hf-hub",
+]
+
 [dev-dependencies]
 tempfile.workspace = true

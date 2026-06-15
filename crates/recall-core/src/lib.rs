@@ -5,6 +5,8 @@
 //! and never writes to stdout — that is the CLI's job.
 
 pub mod config;
+#[cfg(feature = "semantic")]
+pub mod embed;
 pub mod error;
 pub mod index;
 pub mod model;

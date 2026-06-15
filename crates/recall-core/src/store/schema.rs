@@ -5,7 +5,19 @@
 use rusqlite::Connection;
 
 /// Current schema version (stored in `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// v2: session-level embedding vectors (semantic search). Stored as a raw
+/// little-endian f32 BLOB; brute-force cosine in Rust (only ~one vector per
+/// session, so no ANN/extension needed).
+const SCHEMA_V2: &str = r#"
+CREATE TABLE session_vectors(
+  session_fk INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  dim INTEGER NOT NULL,
+  vec BLOB NOT NULL,
+  model TEXT,
+  built_at INTEGER);
+"#;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE session_files(
@@ -109,7 +121,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
         conn.execute_batch(SCHEMA_V1)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
+    if version < 2 {
+        conn.execute_batch(SCHEMA_V2)?;
+    }
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }

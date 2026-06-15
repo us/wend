@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
 use recall_core::model::Block;
-use recall_core::store::{SessionRef, Store};
+use recall_core::store::{SearchHit, SessionRef, Store};
 use recall_core::{config, index, search};
 
 fn main() -> std::process::ExitCode {
@@ -33,9 +33,6 @@ fn run(args: Cli) -> Result<()> {
             if include_subagents {
                 tracing::warn!("--include-subagents not yet implemented; indexing top-level only");
             }
-            if embed {
-                tracing::warn!("--embed not yet implemented");
-            }
             let db = config::index_db_path()?;
             let projects = config::projects_dir()?;
             let mut store =
@@ -46,6 +43,9 @@ fn run(args: Cli) -> Result<()> {
                 "indexed {} session(s) — {} unchanged, {} files seen, {} bad lines skipped",
                 stats.indexed, stats.skipped_unchanged, stats.files_seen, stats.parse_skipped_lines
             );
+            if embed {
+                run_embed(&mut store)?;
+            }
             println!("index: {}", db.display());
             Ok(())
         }
@@ -56,13 +56,14 @@ fn run(args: Cli) -> Result<()> {
             json,
             limit,
         } => {
-            if semantic {
-                tracing::warn!("--semantic not yet implemented; keyword only");
-            }
             let db = config::index_db_path()?;
             let store =
                 Store::open(&db).with_context(|| format!("opening index at {}", db.display()))?;
-            let hits = search::search(&store, &query, limit)?;
+            let hits = if semantic {
+                run_semantic(&store, &query, limit)?
+            } else {
+                search::search(&store, &query, limit)?
+            };
             if json {
                 println!("{}", serde_json::to_string(&hits)?);
             } else if hits.is_empty() {
@@ -95,6 +96,17 @@ fn run(args: Cli) -> Result<()> {
                 let store = Store::open(&db)?;
                 println!("sessions:     {}", store.session_count()?);
                 println!("messages:     {}", store.message_count()?);
+                let embedded = store.session_vector_count().unwrap_or(0);
+                let semantic_build = cfg!(feature = "semantic");
+                println!(
+                    "semantic:     {} ({} session(s) embedded)",
+                    if semantic_build {
+                        "built-in"
+                    } else {
+                        "not in this build (rebuild with --features semantic)"
+                    },
+                    embedded
+                );
             } else {
                 println!("index:        not built — run `recall index`");
             }
@@ -301,6 +313,31 @@ fn run(args: Cli) -> Result<()> {
 fn open_store() -> Result<Store> {
     let db = config::index_db_path()?;
     Store::open(&db).with_context(|| format!("opening index at {}", db.display()))
+}
+
+#[cfg(feature = "semantic")]
+fn run_embed(store: &mut Store) -> Result<()> {
+    eprintln!("embedding sessions (first run downloads the model)…");
+    let n = recall_core::embed::build_index(store)?;
+    println!("embedded {n} new session(s) for semantic search");
+    Ok(())
+}
+
+#[cfg(not(feature = "semantic"))]
+fn run_embed(_store: &mut Store) -> Result<()> {
+    tracing::warn!("--embed needs a build with --features semantic; skipping");
+    Ok(())
+}
+
+#[cfg(feature = "semantic")]
+fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    Ok(recall_core::embed::hybrid_search(store, query, limit)?)
+}
+
+#[cfg(not(feature = "semantic"))]
+fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    tracing::warn!("--semantic needs a build with --features semantic; keyword only");
+    Ok(search::search(store, query, limit)?)
 }
 
 /// Resolve a short session-id prefix to exactly one session, or report candidates.

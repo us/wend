@@ -22,6 +22,14 @@ pub fn index_db_path() -> Result<PathBuf> {
     Ok(app_strategy()?.data_dir().join("index.db"))
 }
 
+/// Directory for cached embedding models. Override with `RECALL_MODEL_CACHE`.
+pub fn model_cache_dir() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("RECALL_MODEL_CACHE") {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(app_strategy()?.cache_dir().join("models"))
+}
+
 /// Directory holding Claude Code session transcripts (`~/.claude/projects`).
 /// Override with `RECALL_PROJECTS`.
 pub fn projects_dir() -> Result<PathBuf> {

@@ -62,6 +62,15 @@ pub struct SessionBrief {
     pub message_count: i64,
 }
 
+/// A session vector with metadata, for brute-force semantic search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VecRow {
+    pub session_id: String,
+    pub title: String,
+    pub project: String,
+    pub vec: Vec<f32>,
+}
+
 /// A worktree-state record linking a session to its origin repo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorktreeInfo {
@@ -434,6 +443,81 @@ impl Store {
         Ok(set)
     }
 
+    /// Sessions that have no embedding yet, with a representative text (title +
+    /// first non-empty message) to embed. Makes `index --embed` incremental.
+    pub fn sessions_needing_vectors(&self) -> Result<Vec<(i64, String)>> {
+        // Representative text = topical title + the first *substantive* user
+        // message. Skip boilerplate first turns (slash-commands like `/clear`,
+        // `<local-command-caveat>` tags, tiny acks) so the embedding captures the
+        // session's real topic, not noise.
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id,
+                TRIM(COALESCE(s.title,'') || '. ' ||
+                     COALESCE(substr((SELECT m.text_for_fts FROM messages m
+                               WHERE m.session_fk=s.id AND m.role='user'
+                                 AND m.text_for_fts<>''
+                                 AND m.text_for_fts NOT LIKE '<%'
+                                 AND m.text_for_fts NOT LIKE '/%'
+                                 AND length(m.text_for_fts) > 15
+                               ORDER BY m.line_no LIMIT 1), 1, 2000), ''))
+             FROM sessions s
+             WHERE s.id NOT IN (SELECT session_fk FROM session_vectors)",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Store (or replace) a session's embedding vector.
+    pub fn store_session_vector(
+        &mut self,
+        session_pk: i64,
+        model: &str,
+        vec: &[f32],
+    ) -> Result<()> {
+        let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+        self.conn.execute(
+            "INSERT INTO session_vectors(session_fk, dim, vec, model, built_at)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(session_fk) DO UPDATE SET
+                dim=excluded.dim, vec=excluded.vec, model=excluded.model, built_at=excluded.built_at",
+            params![session_pk, vec.len() as i64, blob, model, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Number of sessions with an embedding.
+    pub fn session_vector_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM session_vectors", [], |r| r.get(0))?)
+    }
+
+    /// All session vectors + metadata, for brute-force semantic search.
+    pub fn all_session_vectors(&self) -> Result<Vec<VecRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''), v.vec
+             FROM session_vectors v JOIN sessions s ON s.id=v.session_fk",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let blob: Vec<u8> = r.get(3)?;
+            Ok(VecRow {
+                session_id: r.get(0)?,
+                title: r.get(1)?,
+                project: r.get(2)?,
+                vec: bytes_to_f32(&blob),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// All sessions as lightweight summaries (most recent first) for topology.
     pub fn all_sessions(&self) -> Result<Vec<SessionBrief>> {
         let mut stmt = self.conn.prepare(
@@ -557,6 +641,13 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Decode a little-endian f32 BLOB back into a vector.
+fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 #[cfg(unix)]

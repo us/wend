@@ -22,12 +22,17 @@ is its own index (`~/.local/share/recall/index.db`, `0600`).
 cargo install --path crates/recall-cli   # puts `recall` on your PATH
 recall index                             # build the index (~15s for ~200 sessions, then incremental)
 recall doctor                            # check status
+
+# optional: semantic (meaning-based) search — heavier build, pure-Rust Candle model
+cargo install --path crates/recall-cli --features semantic
+recall index --embed                     # downloads the bge model once, embeds sessions
 ```
 
 ## Use
 
 ```bash
-recall search "rust sqlite fts"           # one result per session, best match
+recall search "rust sqlite fts"           # keyword (BM25, stemmed, session-grouped)
+recall search "fixing a crash" --semantic # meaning-based (hybrid keyword+vector); needs --features semantic build
 recall search "auth bug" --json           # machine-readable (for scripts/skills)
 recall show <id>                          # read a transcript (--head/--tail to window)
 recall show <id> --recovered              # surface pre-compaction history the UI hid
@@ -54,10 +59,13 @@ This adds:
 
 ## Status
 
-Working today: index, search (keyword, session-grouped, title/alias-boosted),
-show (+recovered), resume, name, tree, doctor — verified on a real 213-session /
-178k-message corpus. Not yet implemented: semantic search (`--semantic`/`--embed`),
-subagent indexing (`--include-subagents`), `export`, cross-platform release
-binaries. See `PLAN.md` / `ARCHITECTURE.md` / `IMPLEMENTATION.md`.
+Working today: index, search (keyword + optional **semantic** hybrid), show
+(+recovered), resume, name, tree, doctor — verified on a real 213-session /
+178k-message corpus. Semantic search is opt-in (`--features semantic`): pure-Rust
+Candle `bge-small-en-v1.5`, one vector per session, cosine + RRF fusion with
+keyword (first `index --embed` downloads the model and is slow on CPU, then
+incremental). Not yet implemented: subagent indexing (`--include-subagents`),
+`export`, cross-platform release binaries. See `PLAN.md` / `ARCHITECTURE.md` /
+`IMPLEMENTATION.md`.
 
 MIT.

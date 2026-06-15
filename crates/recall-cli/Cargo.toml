@@ -14,7 +14,7 @@ path = "src/main.rs"
 [features]
 default = []
 tui = []        # interactive picker (nucleo + ratatui), wired in a later step
-semantic = []   # local embeddings (candle + sqlite-vec), wired in a later step
+semantic = ["recall-core/semantic"] # local embeddings (Candle, opt-in)
 
 [dependencies]
 recall-core.workspace = true
