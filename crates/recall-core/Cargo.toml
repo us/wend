@@ -17,22 +17,14 @@ etcetera.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 
-# Optional: local semantic search (pure-Rust Candle embeddings). Opt-in because
+# Optional: local semantic search via fastembed (ONNX Runtime). Opt-in because
 # it's heavy (model download, larger binary) and the keyword core needs none of it.
-candle-core = { version = "0.10", optional = true }
-candle-nn = { version = "0.10", optional = true }
-candle-transformers = { version = "0.10", optional = true }
-tokenizers = { version = "0.23", optional = true }
-hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
+# ort gives ~5-10x the CPU throughput of a pure-Rust path — the speed that makes
+# embedding the whole corpus practical.
+fastembed = { version = "5", optional = true }
 
 [features]
-semantic = [
-  "dep:candle-core",
-  "dep:candle-nn",
-  "dep:candle-transformers",
-  "dep:tokenizers",
-  "dep:hf-hub",
-]
+semantic = ["dep:fastembed"]
 
 [dev-dependencies]
 tempfile.workspace = true

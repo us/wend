@@ -5,15 +5,35 @@
 use rusqlite::Connection;
 
 /// Current schema version (stored in `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
-/// v2: session-level embedding vectors (semantic search). Stored as a raw
-/// little-endian f32 BLOB; brute-force cosine in Rust (only ~one vector per
-/// session, so no ANN/extension needed).
+/// v2: session-level embedding vectors (superseded by chunk-level in v3).
 const SCHEMA_V2: &str = r#"
 CREATE TABLE session_vectors(
   session_fk INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   dim INTEGER NOT NULL,
+  vec BLOB NOT NULL,
+  model TEXT,
+  built_at INTEGER);
+"#;
+
+/// v3: CHUNK-level semantic search. Each session is split into message-aligned
+/// text chunks; each chunk gets one embedding. Vectors are raw little-endian f32
+/// BLOBs (brute-force cosine in Rust — fast enough at this scale, no ANN needed).
+/// `chunk_vectors` cascades off `chunks` so rebuilding a session's chunks drops
+/// their vectors atomically. Replaces the v2 session-level table.
+const SCHEMA_V3: &str = r#"
+DROP TABLE IF EXISTS session_vectors;
+CREATE TABLE chunks(
+  id INTEGER PRIMARY KEY,
+  session_fk INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  text TEXT NOT NULL);
+CREATE INDEX idx_chunks_session ON chunks(session_fk);
+CREATE TABLE chunk_vectors(
+  chunk_fk INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+  dim INTEGER NOT NULL,
+  dtype TEXT NOT NULL DEFAULT 'f32',
   vec BLOB NOT NULL,
   model TEXT,
   built_at INTEGER);
@@ -124,6 +144,9 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     if version < 2 {
         conn.execute_batch(SCHEMA_V2)?;
+    }
+    if version < 3 {
+        conn.execute_batch(SCHEMA_V3)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())

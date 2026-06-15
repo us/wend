@@ -1,24 +1,23 @@
-//! Local semantic search (opt-in `semantic` feature).
+//! Local semantic search (opt-in `semantic` feature) — CHUNK level via fastembed.
 //!
-//! Embeds a representative text per session (title + first message) with a
-//! pure-Rust Candle BERT model (`bge-small-en-v1.5`, CLS pooling, L2-normalized,
-//! 384-d) and stores one vector per session. Search embeds the query and ranks
-//! by cosine (= dot product, since vectors are normalized) over ~one vector per
-//! session — brute force is plenty at this scale, so no ANN/extension is needed.
-//! Keyword + semantic are fused with Reciprocal Rank Fusion.
+//! Each session is split into message-aligned text chunks (the user's own prompts;
+//! assistant/tool/log turns excluded — what *you asked* defines the topic and
+//! keeps the corpus small/fast). Every chunk is embedded with `fastembed`
+//! (ONNX Runtime — fast CPU throughput) using the multilingual
+//! `multilingual-e5-small` model (384-d, good Turkish). Search embeds the query,
+//! scores chunks by cosine (= dot; fastembed L2-normalizes), rolls chunks up to
+//! their session (max chunk score), and fuses with keyword via RRF.
+//!
+//! e5 is asymmetric: documents get a `passage:` prefix, queries a `query:` prefix.
 
 use crate::error::{Error, Result};
-use crate::store::{SearchHit, Store};
+use crate::store::{ChunkVec, SearchHit, Store};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config};
-use hf_hub::api::sync::ApiBuilder;
-use hf_hub::{Repo, RepoType};
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
-
-const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
-const MAX_TOKENS: usize = 512;
+const MODEL_NAME: &str = "multilingual-e5-small";
+/// Target chunk size in bytes — conservative for multi-byte (Turkish) text so we
+/// stay under the model's 512-token limit (fastembed truncates as a safety net).
+const CHUNK_BYTES: usize = 1200;
 
 fn err<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> Error + '_ {
     move |e| Error::InvalidData(format!("{ctx}: {e}"))
@@ -26,164 +25,160 @@ fn err<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> Error + '_ {
 
 /// A loaded embedding model.
 pub struct Embedder {
-    model: BertModel,
-    tokenizer: Tokenizer,
-    device: Device,
+    model: TextEmbedding,
 }
 
 impl Embedder {
     /// Load the model, downloading + caching it on first use.
     pub fn load() -> Result<Self> {
-        let device = Device::Cpu;
         let cache = crate::config::model_cache_dir()?;
         std::fs::create_dir_all(&cache)?;
-        let api = ApiBuilder::new()
-            .with_cache_dir(cache)
-            .build()
-            .map_err(err("hf-hub init"))?;
-        let repo = api.repo(Repo::new(MODEL_ID.to_string(), RepoType::Model));
-
-        let config_path = repo.get("config.json").map_err(err("download config"))?;
-        let tok_path = repo
-            .get("tokenizer.json")
-            .map_err(err("download tokenizer"))?;
-        let weights = repo
-            .get("model.safetensors")
-            .map_err(err("download weights"))?;
-
-        let cfg: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)
-            .map_err(err("parse config"))?;
-        let mut tokenizer = Tokenizer::from_file(tok_path).map_err(err("load tokenizer"))?;
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: MAX_TOKENS,
-                ..Default::default()
-            }))
-            .map_err(err("truncation"))?;
-        tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
-
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device)
-                .map_err(err("load safetensors"))?
-        };
-        let model = BertModel::load(vb, &cfg).map_err(err("build model"))?;
-        Ok(Self {
-            model,
-            tokenizer,
-            device,
-        })
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::MultilingualE5Small)
+                .with_cache_dir(cache)
+                .with_show_download_progress(true),
+        )
+        .map_err(err("load model"))?;
+        Ok(Self { model })
     }
 
-    /// Embed a batch of texts → L2-normalized 384-d vectors (CLS pooling).
-    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let encodings = self
-            .tokenizer
-            .encode_batch(texts.to_vec(), true)
-            .map_err(err("tokenize"))?;
+    /// Embed passages (documents). fastembed L2-normalizes the output.
+    pub fn embed_passages(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let docs: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
+        self.model.embed(docs, None).map_err(err("embed"))
+    }
 
-        let mut ids = Vec::with_capacity(encodings.len());
-        let mut masks = Vec::with_capacity(encodings.len());
-        for enc in &encodings {
-            ids.push(Tensor::new(enc.get_ids(), &self.device).map_err(err("ids tensor"))?);
-            masks.push(
-                Tensor::new(enc.get_attention_mask(), &self.device).map_err(err("mask tensor"))?,
-            );
-        }
-        let token_ids = Tensor::stack(&ids, 0).map_err(err("stack ids"))?;
-        let attn = Tensor::stack(&masks, 0).map_err(err("stack masks"))?;
-        let token_type_ids = token_ids.zeros_like().map_err(err("ttype"))?;
-
-        let out = self
-            .model
-            .forward(&token_ids, &token_type_ids, Some(&attn))
-            .map_err(err("forward"))?;
-
-        // CLS pooling: hidden state of token 0 → (batch, hidden).
-        let cls = out.i((.., 0)).map_err(err("cls"))?;
-        // L2 normalize.
-        let norm = cls
-            .sqr()
-            .map_err(err("sqr"))?
-            .sum_keepdim(1)
-            .map_err(err("sum"))?
-            .sqrt()
-            .map_err(err("sqrt"))?;
-        let normalized = cls.broadcast_div(&norm).map_err(err("normalize"))?;
-        normalized.to_vec2::<f32>().map_err(err("to_vec2"))
+    /// Embed a single query.
+    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
+        self.model
+            .embed(vec![format!("query: {query}")], None)
+            .map_err(err("embed query"))?
+            .pop()
+            .ok_or_else(|| Error::InvalidData("empty query embedding".into()))
     }
 }
 
-/// Embed all sessions that don't have a vector yet. Returns the count embedded.
-pub fn build_index(store: &mut Store) -> Result<usize> {
-    let pending = store.sessions_needing_vectors()?;
-    if pending.is_empty() {
-        return Ok(0);
+/// Split ordered message texts into message-aligned, ~`CHUNK_BYTES` chunks.
+/// An oversized single message is hard-split (on char boundaries).
+fn chunk_texts(msgs: &[String]) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for m in msgs {
+        let m = m.trim();
+        if m.is_empty() {
+            continue;
+        }
+        if m.len() > CHUNK_BYTES {
+            if !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+            }
+            let chars: Vec<char> = m.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + CHUNK_BYTES).min(chars.len());
+                chunks.push(chars[i..end].iter().collect());
+                i = end;
+            }
+            continue;
+        }
+        if !cur.is_empty() && cur.len() + 1 + m.len() > CHUNK_BYTES {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(m);
     }
-    let embedder = Embedder::load()?;
-    let mut done = 0;
-    // Embed in modest batches to bound memory.
-    for chunk in pending.chunks(32) {
-        let texts: Vec<String> = chunk
-            .iter()
-            .map(|(_, t)| {
-                if t.is_empty() {
-                    " ".to_string()
-                } else {
-                    t.clone()
-                }
-            })
-            .collect();
-        let vectors = embedder.embed_batch(&texts)?;
-        for ((pk, _), v) in chunk.iter().zip(vectors.iter()) {
-            store.store_session_vector(*pk, MODEL_ID, v)?;
-            done += 1;
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Chunk any un-chunked sessions, then embed any chunks without a vector.
+/// Returns `(chunks_created, chunks_embedded)`. Resume-safe.
+pub fn build_index(store: &mut Store) -> Result<(usize, usize)> {
+    let mut created = 0;
+    for pk in store.sessions_without_chunks()? {
+        let msgs = store.semantic_messages(pk)?;
+        for (i, text) in chunk_texts(&msgs).into_iter().enumerate() {
+            store.insert_chunk(pk, i as i64, &text)?;
+            created += 1;
         }
     }
-    Ok(done)
+
+    let pending = store.chunks_needing_vectors()?;
+    if pending.is_empty() {
+        return Ok((created, 0));
+    }
+    let mut embedder = Embedder::load()?;
+    let mut embedded = 0;
+    for batch in pending.chunks(256) {
+        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+        let vectors = embedder.embed_passages(&texts)?;
+        for ((cid, _), v) in batch.iter().zip(vectors.iter()) {
+            store.store_chunk_vector(*cid, MODEL_NAME, v)?;
+            embedded += 1;
+        }
+    }
+    Ok((created, embedded))
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Hybrid search: keyword (BM25) fused with semantic (cosine) via RRF.
+fn snippet_of(text: &str) -> String {
+    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= 140 {
+        one_line
+    } else {
+        let cut: String = one_line.chars().take(140).collect();
+        format!("…{cut}…")
+    }
+}
+
+/// Hybrid search: keyword (BM25) fused with chunk-level semantic (cosine) via RRF.
 pub fn hybrid_search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
     use std::collections::HashMap;
 
     let over = limit.saturating_mul(3).max(limit);
     let keyword = crate::search::search(store, query, over)?;
 
-    // Semantic ranking over session vectors.
+    // Semantic: score every chunk, keep the best chunk per session.
     let mut semantic: Vec<SearchHit> = Vec::new();
-    let vectors = store.all_session_vectors()?;
-    if !vectors.is_empty() {
-        let embedder = Embedder::load()?;
-        let qv = embedder
-            .embed_batch(&[query.to_string()])?
-            .pop()
-            .ok_or_else(|| Error::InvalidData("empty query embedding".into()))?;
-        let mut scored: Vec<(f32, &crate::store::VecRow)> =
-            vectors.iter().map(|r| (dot(&qv, &r.vec), r)).collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (_s, r) in scored.into_iter().take(over) {
-            semantic.push(SearchHit {
-                session_id: r.session_id.clone(),
-                title: r.title.clone(),
-                project: r.project.clone(),
-                line_no: 0,
-                snippet: "(semantic match)".to_string(),
-                rank: 0.0,
-            });
+    let chunks = store.all_chunk_vectors()?;
+    if !chunks.is_empty() {
+        let mut embedder = Embedder::load()?;
+        let qv = embedder.embed_query(query)?;
+        let mut best: HashMap<String, (f32, ChunkVec)> = HashMap::new();
+        for c in chunks {
+            let s = dot(&qv, &c.vec);
+            best.entry(c.session_id.clone())
+                .and_modify(|e| {
+                    if s > e.0 {
+                        *e = (s, c.clone());
+                    }
+                })
+                .or_insert((s, c));
         }
+        let mut ranked: Vec<(f32, ChunkVec)> = best.into_values().collect();
+        ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(over);
+        semantic = ranked
+            .into_iter()
+            .map(|(_, c)| SearchHit {
+                session_id: c.session_id,
+                title: c.title,
+                project: c.project,
+                line_no: 0,
+                snippet: snippet_of(&c.text),
+                rank: 0.0,
+            })
+            .collect();
     }
 
-    // Reciprocal Rank Fusion.
+    // Reciprocal Rank Fusion (keyword first, so its richer snippet wins on ties).
     const K: f64 = 60.0;
     let mut score: HashMap<String, f64> = HashMap::new();
     let mut info: HashMap<String, SearchHit> = HashMap::new();
@@ -194,7 +189,6 @@ pub fn hybrid_search(store: &Store, query: &str, limit: usize) -> Result<Vec<Sea
     }
     for (rank, h) in semantic.iter().enumerate() {
         *score.entry(h.session_id.clone()).or_default() += 1.0 / (K + rank as f64 + 1.0);
-        // keep keyword's richer snippet if we already have it
         info.entry(h.session_id.clone())
             .or_insert_with(|| h.clone());
     }
@@ -209,14 +203,23 @@ pub fn hybrid_search(store: &Store, query: &str, limit: usize) -> Result<Vec<Sea
 
 #[cfg(test)]
 mod tests {
-    use super::dot;
+    use super::{chunk_texts, dot, CHUNK_BYTES};
 
     #[test]
     fn dot_is_cosine_for_normalized_vectors() {
-        // identical normalized vectors → 1.0; orthogonal → 0.0
         let a = [0.6_f32, 0.8];
         assert!((dot(&a, &a) - 1.0).abs() < 1e-6);
         let b = [0.8_f32, -0.6];
         assert!(dot(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chunking_packs_and_splits() {
+        assert_eq!(
+            chunk_texts(&["hello".to_string(), "world".to_string()]).len(),
+            1
+        );
+        assert!(chunk_texts(&["x".repeat(CHUNK_BYTES * 2 + 10)]).len() >= 3);
+        assert!(chunk_texts(&["".to_string(), "  ".to_string()]).is_empty());
     }
 }

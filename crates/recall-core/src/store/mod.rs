@@ -62,12 +62,14 @@ pub struct SessionBrief {
     pub message_count: i64,
 }
 
-/// A session vector with metadata, for brute-force semantic search.
+/// A chunk vector with metadata, for brute-force semantic search.
 #[derive(Debug, Clone, PartialEq)]
-pub struct VecRow {
+pub struct ChunkVec {
     pub session_id: String,
     pub title: String,
     pub project: String,
+    /// The chunk's own text (used as the result snippet).
+    pub text: String,
     pub vec: Vec<f32>,
 }
 
@@ -443,25 +445,51 @@ impl Store {
         Ok(set)
     }
 
-    /// Sessions that have no embedding yet, with a representative text (title +
-    /// first non-empty message) to embed. Makes `index --embed` incremental.
-    pub fn sessions_needing_vectors(&self) -> Result<Vec<(i64, String)>> {
-        // Representative text = topical title + the first *substantive* user
-        // message. Skip boilerplate first turns (slash-commands like `/clear`,
-        // `<local-command-caveat>` tags, tiny acks) so the embedding captures the
-        // session's real topic, not noise.
+    /// Session pks that have no chunks yet (need chunking before embedding).
+    pub fn sessions_without_chunks(&self) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM sessions WHERE id NOT IN (SELECT session_fk FROM chunks)")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Ordered text of the user's OWN prompts for a session (assistant/tool/log/
+    /// boilerplate excluded) — the input to chunking. What you asked defines the
+    /// topic and keeps the embed corpus small and fast.
+    pub fn semantic_messages(&self, session_pk: i64) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id,
-                TRIM(COALESCE(s.title,'') || '. ' ||
-                     COALESCE(substr((SELECT m.text_for_fts FROM messages m
-                               WHERE m.session_fk=s.id AND m.role='user'
-                                 AND m.text_for_fts<>''
-                                 AND m.text_for_fts NOT LIKE '<%'
-                                 AND m.text_for_fts NOT LIKE '/%'
-                                 AND length(m.text_for_fts) > 15
-                               ORDER BY m.line_no LIMIT 1), 1, 2000), ''))
-             FROM sessions s
-             WHERE s.id NOT IN (SELECT session_fk FROM session_vectors)",
+            "SELECT text_for_fts FROM messages
+             WHERE session_fk=?1 AND text_for_fts<>''
+               AND type='user' AND content_json LIKE '[{\"kind\":\"text\"%'
+               AND text_for_fts NOT LIKE '<%' AND text_for_fts NOT LIKE '/%'
+             ORDER BY line_no",
+        )?;
+        let rows = stmt.query_map(params![session_pk], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Insert a chunk, returning its id.
+    pub fn insert_chunk(&mut self, session_pk: i64, ordinal: i64, text: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO chunks(session_fk, ordinal, text) VALUES (?1,?2,?3)",
+            params![session_pk, ordinal, text],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Chunks that still need an embedding (id + text). Resume-safe.
+    pub fn chunks_needing_vectors(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text FROM chunks WHERE id NOT IN (SELECT chunk_fk FROM chunk_vectors)",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
@@ -471,43 +499,39 @@ impl Store {
         Ok(out)
     }
 
-    /// Store (or replace) a session's embedding vector.
-    pub fn store_session_vector(
-        &mut self,
-        session_pk: i64,
-        model: &str,
-        vec: &[f32],
-    ) -> Result<()> {
+    /// Store a chunk's embedding vector.
+    pub fn store_chunk_vector(&mut self, chunk_id: i64, model: &str, vec: &[f32]) -> Result<()> {
         let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.conn.execute(
-            "INSERT INTO session_vectors(session_fk, dim, vec, model, built_at)
-             VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(session_fk) DO UPDATE SET
+            "INSERT INTO chunk_vectors(chunk_fk, dim, dtype, vec, model, built_at)
+             VALUES (?1,?2,'f32',?3,?4,?5)
+             ON CONFLICT(chunk_fk) DO UPDATE SET
                 dim=excluded.dim, vec=excluded.vec, model=excluded.model, built_at=excluded.built_at",
-            params![session_pk, vec.len() as i64, blob, model, now_ms()],
+            params![chunk_id, vec.len() as i64, blob, model, now_ms()],
         )?;
         Ok(())
     }
 
-    /// Number of sessions with an embedding.
-    pub fn session_vector_count(&self) -> Result<i64> {
+    /// Number of embedded chunks.
+    pub fn chunk_vector_count(&self) -> Result<i64> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM session_vectors", [], |r| r.get(0))?)
+            .query_row("SELECT COUNT(*) FROM chunk_vectors", [], |r| r.get(0))?)
     }
 
-    /// All session vectors + metadata, for brute-force semantic search.
-    pub fn all_session_vectors(&self) -> Result<Vec<VecRow>> {
+    /// All chunk vectors + metadata, for brute-force semantic search.
+    pub fn all_chunk_vectors(&self) -> Result<Vec<ChunkVec>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''), v.vec
-             FROM session_vectors v JOIN sessions s ON s.id=v.session_fk",
+            "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''), c.text, v.vec
+             FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_fk JOIN sessions s ON s.id=c.session_fk",
         )?;
         let rows = stmt.query_map([], |r| {
-            let blob: Vec<u8> = r.get(3)?;
-            Ok(VecRow {
+            let blob: Vec<u8> = r.get(4)?;
+            Ok(ChunkVec {
                 session_id: r.get(0)?,
                 title: r.get(1)?,
                 project: r.get(2)?,
+                text: r.get(3)?,
                 vec: bytes_to_f32(&blob),
             })
         })?;

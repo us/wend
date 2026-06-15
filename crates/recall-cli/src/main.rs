@@ -96,10 +96,10 @@ fn run(args: Cli) -> Result<()> {
                 let store = Store::open(&db)?;
                 println!("sessions:     {}", store.session_count()?);
                 println!("messages:     {}", store.message_count()?);
-                let embedded = store.session_vector_count().unwrap_or(0);
+                let embedded = store.chunk_vector_count().unwrap_or(0);
                 let semantic_build = cfg!(feature = "semantic");
                 println!(
-                    "semantic:     {} ({} session(s) embedded)",
+                    "semantic:     {} ({} chunk(s) embedded)",
                     if semantic_build {
                         "built-in"
                     } else {
@@ -317,9 +317,9 @@ fn open_store() -> Result<Store> {
 
 #[cfg(feature = "semantic")]
 fn run_embed(store: &mut Store) -> Result<()> {
-    eprintln!("embedding sessions (first run downloads the model)…");
-    let n = recall_core::embed::build_index(store)?;
-    println!("embedded {n} new session(s) for semantic search");
+    eprintln!("building semantic index (first run downloads the model; embedding is CPU-bound)…");
+    let (created, embedded) = recall_core::embed::build_index(store)?;
+    println!("semantic: {created} new chunk(s) created, {embedded} embedded");
     Ok(())
 }
 
