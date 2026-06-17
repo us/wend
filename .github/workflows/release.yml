@@ -1,0 +1,71 @@
+name: Release
+
+# Tag a version (e.g. `v0.1.0`) to build cross-platform binaries and attach them
+# to a GitHub Release. Binaries are the DEFAULT (keyword) build — lean and fully
+# portable (no ONNX/ort). Semantic search stays an opt-in source build
+# (`cargo install --features semantic`).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,      target: aarch64-apple-darwin }
+          - { os: macos-13,      target: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked -p recall-cli --target ${{ matrix.target }}
+      - name: Verify musl binary is static
+        if: matrix.musl
+        run: |
+          file target/${{ matrix.target }}/release/recall
+          ldd target/${{ matrix.target }}/release/recall 2>&1 | grep -q "not a dynamic executable" \
+            && echo "OK: static" || (echo "FAIL: not static" && exit 1)
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "$GITHUB_WORKSPACE/recall-${{ matrix.target }}.tar.gz" recall
+          cd "$GITHUB_WORKSPACE"
+          shasum -a 256 "recall-${{ matrix.target }}.tar.gz" > "recall-${{ matrix.target }}.tar.gz.sha256"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a "$env:GITHUB_WORKSPACE/recall-${{ matrix.target }}.zip" recall.exe
+          cd "$env:GITHUB_WORKSPACE"
+          (Get-FileHash "recall-${{ matrix.target }}.zip" -Algorithm SHA256).Hash > "recall-${{ matrix.target }}.zip.sha256"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            recall-${{ matrix.target }}.tar.gz
+            recall-${{ matrix.target }}.tar.gz.sha256
+            recall-${{ matrix.target }}.zip
+            recall-${{ matrix.target }}.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

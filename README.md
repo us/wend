@@ -17,8 +17,15 @@ is its own index (`~/.local/share/recall/index.db`, `0600`).
 
 ## Install
 
+**Prebuilt binary** (once a `v*` tag is released): download the archive for your
+platform from GitHub Releases (macOS arm64/x64, Linux x64 gnu+musl static,
+Windows x64), unpack, and put `recall` on your PATH. These are the lean
+keyword-only build. On macOS a downloaded binary is Gatekeeper-quarantined unless
+notarized; `brew`/`curl|sh` installs avoid the quarantine bit.
+
+**From source:**
+
 ```bash
-# from this repo
 cargo install --path crates/recall-cli   # puts `recall` on your PATH
 recall index                             # build the index (~15s for ~200 sessions, then incremental)
 recall doctor                            # check status
