@@ -30,9 +30,9 @@ cargo install --path crates/recall-cli   # puts `recall` on your PATH
 recall index                             # build the index (~15s for ~200 sessions, then incremental)
 recall doctor                            # check status
 
-# optional: semantic (meaning-based) search — heavier build, pure-Rust Candle model
+# optional: semantic (meaning-based) search — heavier build (ONNX Runtime)
 cargo install --path crates/recall-cli --features semantic
-recall index --embed                     # downloads the bge model once, embeds sessions
+recall index --embed                     # downloads the e5 model once, embeds your prompts
 ```
 
 ## Use
@@ -41,7 +41,9 @@ recall index --embed                     # downloads the bge model once, embeds 
 recall search "rust sqlite fts"           # keyword (BM25, stemmed, session-grouped)
 recall search "fixing a crash" --semantic # meaning-based (hybrid keyword+vector); needs --features semantic build
 recall search "auth bug" --json           # machine-readable (for scripts/skills)
-recall show <id>                          # read a transcript (--head/--tail to window)
+recall show <id>                          # read a transcript (numbered messages, total shown)
+recall show <id> --count                  # just how many messages
+recall show <id> --range 10:20            # messages 10–20 (also --head N / --tail N)
 recall show <id> --recovered              # surface pre-compaction history the UI hid
 recall resume <id>                        # prints the cd + claude --resume command
 recall name <id> "payment-spike"          # alias a session so you can find it later
@@ -67,12 +69,14 @@ This adds:
 ## Status
 
 Working today: index, search (keyword + optional **semantic** hybrid), show
-(+recovered), resume, name, tree, doctor — verified on a real 213-session /
-178k-message corpus. Semantic search is opt-in (`--features semantic`): pure-Rust
-Candle `bge-small-en-v1.5`, one vector per session, cosine + RRF fusion with
-keyword (first `index --embed` downloads the model and is slow on CPU, then
-incremental). Not yet implemented: subagent indexing (`--include-subagents`),
-`export`, cross-platform release binaries. See `PLAN.md` / `ARCHITECTURE.md` /
+(+recovered, --range/--count, numbered messages), resume, name, tree, doctor —
+verified on a real 213-session / 178k-message corpus. Semantic search is opt-in
+(`--features semantic`): `fastembed` (ONNX Runtime) with the multilingual
+`multilingual-e5-small` model, embedded at the **chunk** level over your own
+prompts, cosine + RRF fusion with keyword (first `index --embed` downloads the
+model once, then incremental; thread use is capped so it won't pin the machine —
+override with `RECALL_EMBED_THREADS`). Not yet implemented: subagent indexing
+(`--include-subagents`), `export`. See `PLAN.md` / `ARCHITECTURE.md` /
 `IMPLEMENTATION.md`.
 
 MIT.
