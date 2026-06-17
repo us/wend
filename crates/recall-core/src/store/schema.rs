@@ -22,15 +22,18 @@ CREATE TABLE session_vectors(
 /// BLOBs (brute-force cosine in Rust — fast enough at this scale, no ANN needed).
 /// `chunk_vectors` cascades off `chunks` so rebuilding a session's chunks drops
 /// their vectors atomically. Replaces the v2 session-level table.
+/// `IF NOT EXISTS` throughout: an intermediate dev build may have created these
+/// tables while leaving `user_version` at 2, so the migration must tolerate
+/// partially-present objects rather than erroring on a re-create.
 const SCHEMA_V3: &str = r#"
 DROP TABLE IF EXISTS session_vectors;
-CREATE TABLE chunks(
+CREATE TABLE IF NOT EXISTS chunks(
   id INTEGER PRIMARY KEY,
   session_fk INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   ordinal INTEGER NOT NULL,
   text TEXT NOT NULL);
-CREATE INDEX idx_chunks_session ON chunks(session_fk);
-CREATE TABLE chunk_vectors(
+CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_fk);
+CREATE TABLE IF NOT EXISTS chunk_vectors(
   chunk_fk INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
   dim INTEGER NOT NULL,
   dtype TEXT NOT NULL DEFAULT 'f32',
@@ -150,4 +153,45 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_is_idempotent_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // second call must not error
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// Regression: an intermediate dev build created the chunk tables but left
+    /// `user_version` at 2. The v3 migration must tolerate the pre-existing
+    /// tables instead of failing with "table chunks already exists".
+    #[test]
+    fn migrate_tolerates_v3_tables_present_at_version_2() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        // Simulate the drift: chunk tables already exist...
+        conn.execute_batch(
+            "CREATE TABLE chunks(id INTEGER PRIMARY KEY, session_fk INTEGER, ordinal INTEGER, text TEXT);
+             CREATE INDEX idx_chunks_session ON chunks(session_fk);
+             CREATE TABLE chunk_vectors(chunk_fk INTEGER PRIMARY KEY, dim INTEGER, dtype TEXT, vec BLOB, model TEXT, built_at INTEGER);",
+        )
+        .unwrap();
+        // ...but the version was never bumped past 2.
+        conn.pragma_update(None, "user_version", 2_i64).unwrap();
+
+        migrate(&conn).unwrap(); // must not error
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
 }
