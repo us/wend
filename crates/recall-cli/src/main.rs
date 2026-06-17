@@ -317,7 +317,11 @@ fn open_store() -> Result<Store> {
 
 #[cfg(feature = "semantic")]
 fn run_embed(store: &mut Store) -> Result<()> {
-    eprintln!("building semantic index (first run downloads the model; embedding is CPU-bound)…");
+    let threads = recall_core::embed::embed_threads();
+    eprintln!(
+        "building semantic index — CPU-bound, using {threads} thread(s) \
+         (set RECALL_EMBED_THREADS to change; first run also downloads the model)…"
+    );
     let (created, embedded) = recall_core::embed::build_index(store)?;
     println!("semantic: {created} new chunk(s) created, {embedded} embedded");
     Ok(())

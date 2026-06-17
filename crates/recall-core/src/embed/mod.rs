@@ -23,6 +23,21 @@ fn err<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> Error + '_ {
     move |e| Error::InvalidData(format!("{ctx}: {e}"))
 }
 
+/// How many CPU threads embedding may use. Gentle by default (~a quarter of the
+/// cores) so a full embed doesn't pin the whole machine; override with
+/// `RECALL_EMBED_THREADS`. ONNX Runtime would otherwise grab every core.
+pub fn embed_threads() -> usize {
+    if let Ok(v) = std::env::var("RECALL_EMBED_THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores / 4).max(1)
+}
+
 /// A loaded embedding model.
 pub struct Embedder {
     model: TextEmbedding,
@@ -36,6 +51,7 @@ impl Embedder {
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::MultilingualE5Small)
                 .with_cache_dir(cache)
+                .with_intra_threads(embed_threads()) // gentle: don't pin every core
                 .with_show_download_progress(true),
         )
         .map_err(err("load model"))?;
