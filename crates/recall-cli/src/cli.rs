@@ -50,12 +50,18 @@ pub enum Command {
         /// Reconstruct and include pre-compaction history.
         #[arg(long)]
         recovered: bool,
-        /// Show only the first N visible messages.
+        /// Show only the first N messages.
         #[arg(long)]
         head: Option<usize>,
-        /// Show only the last N visible messages.
+        /// Show only the last N messages.
         #[arg(long)]
         tail: Option<usize>,
+        /// Show a 1-based inclusive range, e.g. 10:20 (or 10-20).
+        #[arg(long)]
+        range: Option<String>,
+        /// Print only the message count, nothing else.
+        #[arg(long)]
+        count: bool,
     },
     /// Show the worktree/subagent topology for a project.
     Tree {

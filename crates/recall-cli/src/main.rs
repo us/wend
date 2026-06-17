@@ -118,6 +118,8 @@ fn run(args: Cli) -> Result<()> {
             recovered,
             head,
             tail,
+            range,
+            count,
         } => {
             let store = open_store()?;
             let sess = resolve_or_report(&store, &id)?;
@@ -171,34 +173,45 @@ fn run(args: Cli) -> Result<()> {
                 }
             }
 
-            // Window: explicit --head/--tail, else a soft default cap so a huge
-            // session doesn't dump tens of thousands of lines.
-            const DEFAULT_CAP: usize = 200;
             let total = chunks.len();
-            let mut note: Option<(&str, usize)> = None;
-            let slice: &[String] = match (head, tail) {
-                (Some(n), _) => {
-                    let n = n.min(total);
-                    note = Some(("first", n));
-                    &chunks[..n]
+
+            // --count: just the number.
+            if count {
+                println!("{total}");
+                return Ok(());
+            }
+
+            // Pick the window [start..end) (0-based). Priority: range > head >
+            // tail > a soft default cap so a huge session doesn't flood the term.
+            const DEFAULT_CAP: usize = 200;
+            let (start, end, note): (usize, usize, Option<String>) = if let Some(r) = &range {
+                let (a, b) = parse_range(r)?; // 1-based inclusive
+                let s = a.saturating_sub(1).min(total);
+                let e = b.min(total).max(s);
+                (s, e, Some(format!("messages {}–{} of {total}", s + 1, e)))
+            } else if let Some(n) = head {
+                let e = n.min(total);
+                (0, e, Some(format!("first {e} of {total}")))
+            } else if let Some(n) = tail {
+                let s = total.saturating_sub(n);
+                (s, total, Some(format!("last {} of {total}", total - s)))
+            } else if total > DEFAULT_CAP {
+                // --recovered: the hidden early history is what you want → from start.
+                if recovered {
+                    (
+                        0,
+                        DEFAULT_CAP,
+                        Some(format!("first {DEFAULT_CAP} of {total}")),
+                    )
+                } else {
+                    (
+                        total - DEFAULT_CAP,
+                        total,
+                        Some(format!("last {DEFAULT_CAP} of {total}")),
+                    )
                 }
-                (None, Some(n)) => {
-                    let n = n.min(total);
-                    note = Some(("last", n));
-                    &chunks[total - n..]
-                }
-                (None, None) if total > DEFAULT_CAP => {
-                    // With --recovered the user wants the hidden *early* history,
-                    // so default to the start; otherwise show the most recent.
-                    if recovered {
-                        note = Some(("first", DEFAULT_CAP));
-                        &chunks[..DEFAULT_CAP]
-                    } else {
-                        note = Some(("last", DEFAULT_CAP));
-                        &chunks[total - DEFAULT_CAP..]
-                    }
-                }
-                (None, None) => &chunks[..],
+            } else {
+                (0, total, None)
             };
 
             let title = if sess.title.is_empty() {
@@ -210,16 +223,15 @@ fn run(args: Cli) -> Result<()> {
             if let Some(p) = &sess.project_path {
                 println!("  project: {p}");
             }
+            println!("  {total} messages");
             if let Some(h) = header_extra {
                 println!("{h}");
             }
-            if let Some((which, n)) = note {
-                println!(
-                    "  showing {which} {n} of {total} blocks (use --head/--tail, or `export` for the full transcript)"
-                );
+            if let Some(note) = note {
+                println!("  showing {note}  (--head N / --tail N / --range A:B / --count, or `export` for all)");
             }
-            for c in slice {
-                println!("\n{c}");
+            for (i, c) in chunks[start..end].iter().enumerate() {
+                println!("\n[{}] {c}", start + i + 1);
             }
             Ok(())
         }
@@ -385,6 +397,29 @@ fn title_or(t: &str) -> &str {
     }
 }
 
+/// Parse a 1-based inclusive range like `10:20` or `10-20` into `(start, end)`.
+fn parse_range(s: &str) -> Result<(usize, usize)> {
+    let parts: Vec<&str> = s.splitn(2, [':', '-']).collect();
+    if parts.len() != 2 {
+        anyhow::bail!("range must be A:B, e.g. 10:20");
+    }
+    let a: usize = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad range start: {:?}", parts[0]))?;
+    let b: usize = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad range end: {:?}", parts[1]))?;
+    if a < 1 {
+        anyhow::bail!("range is 1-based; start must be >= 1");
+    }
+    if b < a {
+        anyhow::bail!("range end ({b}) is before start ({a})");
+    }
+    Ok((a, b))
+}
+
 /// Render one stored message into a printable chunk, or `None` if it has no
 /// visible body (empty graph nodes like system/progress).
 fn render_message_chunk(
@@ -442,4 +477,24 @@ fn init_logging(verbose: u8) {
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range;
+
+    #[test]
+    fn parse_range_accepts_colon_and_dash() {
+        assert_eq!(parse_range("3:5").unwrap(), (3, 5));
+        assert_eq!(parse_range("10-20").unwrap(), (10, 20));
+        assert_eq!(parse_range(" 1 : 9 ").unwrap(), (1, 9));
+    }
+
+    #[test]
+    fn parse_range_rejects_bad_input() {
+        assert!(parse_range("0:5").is_err()); // 1-based
+        assert!(parse_range("20:5").is_err()); // end < start
+        assert!(parse_range("abc").is_err());
+        assert!(parse_range("5").is_err());
+    }
 }
