@@ -46,6 +46,13 @@ jobs:
         run: cargo build -p wend-cli --target x86_64-unknown-linux-musl
       - name: assert static binary
         run: |
-          file target/x86_64-unknown-linux-musl/debug/wend
-          ldd target/x86_64-unknown-linux-musl/debug/wend 2>&1 | grep -q "not a dynamic executable" \
-            && echo "OK: static" || (echo "FAIL: not static" && exit 1)
+          BIN=target/x86_64-unknown-linux-musl/debug/wend
+          file "$BIN"
+          # musl links statically; modern Rust emits a static-PIE, so `ldd` no
+          # longer prints "not a dynamic executable". Assert on `file`'s linkage
+          # (accepts both classic static and static-pie) instead.
+          if file "$BIN" | grep -qE 'static-pie linked|statically linked'; then
+            echo "OK: static"
+          else
+            echo "FAIL: not static"; exit 1
+          fi

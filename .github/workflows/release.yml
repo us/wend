@@ -58,9 +58,14 @@ jobs:
       - name: Verify musl binary is static
         if: matrix.musl
         run: |
-          file target/${{ matrix.target }}/release/wend
-          ldd target/${{ matrix.target }}/release/wend 2>&1 | grep -q "not a dynamic executable" \
-            && echo "OK: static" || (echo "FAIL: not static" && exit 1)
+          BIN=target/${{ matrix.target }}/release/wend
+          file "$BIN"
+          # Accept static-pie (modern Rust musl default) as well as classic static.
+          if file "$BIN" | grep -qE 'static-pie linked|statically linked'; then
+            echo "OK: static"
+          else
+            echo "FAIL: not static"; exit 1
+          fi
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
