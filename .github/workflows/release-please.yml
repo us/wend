@@ -1,0 +1,42 @@
+name: Release Please
+
+# Conventional-commit driven releases. On every push to main, release-please
+# maintains a "release PR" that accumulates changes and bumps the version +
+# CHANGELOG. Merging that PR creates the GitHub Release and the `v*` tag, and —
+# in the SAME workflow run — calls release.yml to build and attach the binaries.
+#
+# PAT-free by design: a tag created by the default GITHUB_TOKEN cannot trigger a
+# separate `on: push: tags` workflow, so instead of relying on that trigger we
+# call the binary build as a reusable workflow gated on `release_created`. The
+# only trade-off is that the release PR's own CI is not auto-triggered; if that
+# becomes important, supply an elevated token (PAT or GitHub App) to the
+# release-please step.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}

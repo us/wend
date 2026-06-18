@@ -17,11 +17,21 @@ is its own index (`~/.local/share/wend/index.db`, `0600`).
 
 ## Install
 
-**Prebuilt binary** (once a `v*` tag is released): download the archive for your
-platform from GitHub Releases (macOS arm64/x64, Linux x64 gnu+musl static,
-Windows x64), unpack, and put `wend` on your PATH. These are the lean
-keyword-only build. On macOS a downloaded binary is Gatekeeper-quarantined unless
-notarized; `brew`/`curl|sh` installs avoid the quarantine bit.
+**One-liner** (prebuilt binary, macOS + Linux):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/us/wend/main/install.sh | sh
+```
+
+Pin a version with `WEND_VERSION=v0.1.0` or change the target dir with
+`WEND_INSTALL_DIR=~/.local/bin`. On macOS, `curl|sh` installs avoid the
+Gatekeeper quarantine bit (a binary downloaded via the browser would be
+quarantined unless notarized).
+
+**Prebuilt binary (manual):** download the archive for your platform from
+[GitHub Releases](https://github.com/us/wend/releases) (macOS arm64/x64,
+Linux x64 gnu + musl static, Windows x64), unpack, and put `wend` on your PATH.
+These are the lean keyword-only build.
 
 **From source:**
 

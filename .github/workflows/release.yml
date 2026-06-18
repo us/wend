@@ -1,14 +1,28 @@
-name: Release
+name: Release Binaries
 
-# Tag a version (e.g. `v0.1.0`) to build cross-platform binaries and attach them
-# to a GitHub Release. Binaries are the DEFAULT (keyword) build — lean and fully
-# portable (no ONNX/ort). Semantic search stays an opt-in source build
+# Build cross-platform binaries and attach them to a GitHub Release.
+# Driven two ways, both PAT-free:
+#   1. Automatically by release-please.yml (calls this via `workflow_call` once a
+#      release + tag have been created in the same workflow run).
+#   2. Manually via `workflow_dispatch` against an existing tag (recovery).
+#
+# Binaries are the DEFAULT (keyword) build — lean and fully portable (no
+# ONNX/ort). Semantic search stays an opt-in source build
 # (`cargo install --features semantic`).
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build and upload binaries for (e.g. v0.1.0)"
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build/upload binaries for (e.g. v0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -21,13 +35,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14,      target: aarch64-apple-darwin }
-          - { os: macos-13,      target: x86_64-apple-darwin }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: macos-14,       target: aarch64-apple-darwin }
+          - { os: macos-13,       target: x86_64-apple-darwin }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl, musl: true }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -62,6 +78,7 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
           files: |
             wend-${{ matrix.target }}.tar.gz
             wend-${{ matrix.target }}.tar.gz.sha256
