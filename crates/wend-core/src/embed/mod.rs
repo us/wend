@@ -25,9 +25,9 @@ fn err<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> Error + '_ {
 
 /// How many CPU threads embedding may use. Gentle by default (~a quarter of the
 /// cores) so a full embed doesn't pin the whole machine; override with
-/// `RECALL_EMBED_THREADS`. ONNX Runtime would otherwise grab every core.
+/// `WEND_EMBED_THREADS`. ONNX Runtime would otherwise grab every core.
 pub fn embed_threads() -> usize {
-    if let Ok(v) = std::env::var("RECALL_EMBED_THREADS") {
+    if let Ok(v) = std::env::var("WEND_EMBED_THREADS") {
         if let Ok(n) = v.parse::<usize>() {
             return n.max(1);
         }

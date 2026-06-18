@@ -1,6 +1,6 @@
 [package]
-name = "recall-core"
-description = "Core engine for session-recall: parse, index, search, recover, topology over Claude Code transcripts"
+name = "wend-core"
+description = "Core engine for wend: parse, index, search, recover, topology over Claude Code transcripts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

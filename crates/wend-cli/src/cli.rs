@@ -3,9 +3,9 @@
 
 use clap::{Parser, Subcommand};
 
-/// session-recall: find, recover, and visualize your Claude Code session history.
+/// wend: find, recover, and visualize your Claude Code session history.
 #[derive(Debug, Parser)]
-#[command(name = "recall", version, about)]
+#[command(name = "wend", version, about)]
 pub struct Cli {
     /// Increase log verbosity (-v, -vv). Logs go to stderr; stdout stays clean.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]

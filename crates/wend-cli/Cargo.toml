@@ -1,6 +1,6 @@
 [package]
-name = "recall-cli"
-description = "session-recall CLI: find, recover, and visualize your Claude Code session history"
+name = "wend-cli"
+description = "wend CLI: find, recover, and visualize your Claude Code session history"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,16 +8,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "recall"
+name = "wend"
 path = "src/main.rs"
 
 [features]
 default = []
 tui = []        # interactive picker (nucleo + ratatui), wired in a later step
-semantic = ["recall-core/semantic"] # local embeddings (Candle, opt-in)
+semantic = ["wend-core/semantic"] # local embeddings (fastembed/ONNX, opt-in)
 
 [dependencies]
-recall-core.workspace = true
+wend-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

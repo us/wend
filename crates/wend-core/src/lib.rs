@@ -1,4 +1,4 @@
-//! `recall-core` — the pure engine behind session-recall.
+//! `wend-core` — the pure engine behind wend.
 //!
 //! Parses Claude Code `.jsonl` transcripts, indexes them, and serves search,
 //! compaction-recovery, and worktree/subagent topology. This crate is UI-free

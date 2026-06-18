@@ -1,12 +1,12 @@
 //! Golden integration test over the committed fixture corpus. Hermetic: reads
 //! only from `fixtures/`, never `~/.claude`.
 
-use recall_core::model::{Routed, TitleUpdate};
-use recall_core::parser::parse_file;
 use std::path::PathBuf;
+use wend_core::model::{Routed, TitleUpdate};
+use wend_core::parser::parse_file;
 
 fn fixture(name: &str) -> PathBuf {
-    // CARGO_MANIFEST_DIR = crates/recall-core; repo root is two levels up.
+    // CARGO_MANIFEST_DIR = crates/wend-core; repo root is two levels up.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures")
         .join(name)

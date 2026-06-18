@@ -1,4 +1,4 @@
-//! session-recall CLI entry point.
+//! wend CLI entry point.
 
 mod cli;
 mod render;
@@ -6,9 +6,9 @@ mod render;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
-use recall_core::model::Block;
-use recall_core::store::{SearchHit, SessionRef, Store};
-use recall_core::{config, index, search};
+use wend_core::model::Block;
+use wend_core::store::{SearchHit, SessionRef, Store};
+use wend_core::{config, index, search};
 
 fn main() -> std::process::ExitCode {
     let args = Cli::parse();
@@ -68,7 +68,7 @@ fn run(args: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string(&hits)?);
             } else if hits.is_empty() {
                 if store.session_count().unwrap_or(0) == 0 {
-                    println!("index is empty — run `recall index` first");
+                    println!("index is empty — run `wend index` first");
                 } else {
                     println!("no matches for {query:?}");
                 }
@@ -89,7 +89,7 @@ fn run(args: Cli) -> Result<()> {
         Command::Doctor => {
             let db = config::index_db_path()?;
             let projects = config::projects_dir()?;
-            println!("recall {}", recall_core::VERSION);
+            println!("wend {}", wend_core::VERSION);
             println!("projects dir: {}", projects.display());
             println!("index db:     {}", db.display());
             if db.exists() {
@@ -108,7 +108,7 @@ fn run(args: Cli) -> Result<()> {
                     embedded
                 );
             } else {
-                println!("index:        not built — run `recall index`");
+                println!("index:        not built — run `wend index`");
             }
             Ok(())
         }
@@ -129,7 +129,7 @@ fn run(args: Cli) -> Result<()> {
             let mut chunks: Vec<String> = Vec::new();
             let mut header_extra: Option<String> = None;
             if recovered {
-                let rec = recall_core::recover::recover_session(&store, sess.pk)?;
+                let rec = wend_core::recover::recover_session(&store, sess.pk)?;
                 let mut h = format!(
                     "  recovered: {} pre-compaction message(s) across {} boundary(ies) hidden by the live UI",
                     rec.recovered_count, rec.boundary_count
@@ -143,7 +143,7 @@ fn run(args: Cli) -> Result<()> {
                 header_extra = Some(h);
                 for item in &rec.items {
                     match item {
-                        recall_core::recover::Item::Boundary(b) => {
+                        wend_core::recover::Item::Boundary(b) => {
                             chunks.push(format!(
                                 "─── ⟪ compaction boundary · {} · {}→{} tokens ⟫ ───",
                                 b.trigger.as_deref().unwrap_or("?"),
@@ -151,7 +151,7 @@ fn run(args: Cli) -> Result<()> {
                                 opt_num(b.post_tokens),
                             ));
                         }
-                        recall_core::recover::Item::Message(rm) => {
+                        wend_core::recover::Item::Message(rm) => {
                             if let Some(chunk) = render_message_chunk(
                                 &rm.row.content_json,
                                 &rm.row.role,
@@ -269,13 +269,13 @@ fn run(args: Cli) -> Result<()> {
         }
 
         Command::Tree { project } => {
-            use recall_core::topology::{self, Confidence};
+            use wend_core::topology::{self, Confidence};
             let store = open_store()?;
             let topo = topology::build(&store, project.as_deref())?;
             if topo.projects.is_empty() {
                 match &project {
                     Some(p) => println!("no sessions match {p:?}"),
-                    None => println!("no sessions indexed — run `recall index`"),
+                    None => println!("no sessions indexed — run `wend index`"),
                 }
                 return Ok(());
             }
@@ -316,7 +316,7 @@ fn run(args: Cli) -> Result<()> {
         }
         Command::Export { .. } => {
             anyhow::bail!(
-                "`export` is not implemented yet — use `recall show <id>` to read a transcript for now"
+                "`export` is not implemented yet — use `wend show <id>` to read a transcript for now"
             )
         }
     }
@@ -329,12 +329,12 @@ fn open_store() -> Result<Store> {
 
 #[cfg(feature = "semantic")]
 fn run_embed(store: &mut Store) -> Result<()> {
-    let threads = recall_core::embed::embed_threads();
+    let threads = wend_core::embed::embed_threads();
     eprintln!(
         "building semantic index — CPU-bound, using {threads} thread(s) \
-         (set RECALL_EMBED_THREADS to change; first run also downloads the model)…"
+         (set WEND_EMBED_THREADS to change; first run also downloads the model)…"
     );
-    let (created, embedded) = recall_core::embed::build_index(store)?;
+    let (created, embedded) = wend_core::embed::build_index(store)?;
     println!("semantic: {created} new chunk(s) created, {embedded} embedded");
     Ok(())
 }
@@ -347,7 +347,7 @@ fn run_embed(_store: &mut Store) -> Result<()> {
 
 #[cfg(feature = "semantic")]
 fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-    Ok(recall_core::embed::hybrid_search(store, query, limit)?)
+    Ok(wend_core::embed::hybrid_search(store, query, limit)?)
 }
 
 #[cfg(not(feature = "semantic"))]
@@ -360,7 +360,7 @@ fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHi
 fn resolve_or_report(store: &Store, id: &str) -> Result<SessionRef> {
     let candidates = store.find_sessions(id, 25)?;
     match candidates.len() {
-        0 => anyhow::bail!("no session matching '{id}' — run `recall search` to find one"),
+        0 => anyhow::bail!("no session matching '{id}' — run `wend search` to find one"),
         1 => Ok(candidates.into_iter().next().unwrap()),
         n => {
             // an exact full-id match disambiguates
@@ -470,7 +470,7 @@ fn init_logging(verbose: u8) {
         _ => "trace",
     };
     let filter =
-        EnvFilter::try_from_env("RECALL_LOG").unwrap_or_else(|_| EnvFilter::new(default_level));
+        EnvFilter::try_from_env("WEND_LOG").unwrap_or_else(|_| EnvFilter::new(default_level));
 
     fmt()
         .with_env_filter(filter)

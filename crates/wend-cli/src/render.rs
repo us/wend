@@ -1,6 +1,6 @@
 //! Render stored content blocks into a readable terminal transcript.
 
-use recall_core::model::Block;
+use wend_core::model::Block;
 
 /// Render a message's blocks into a human-readable string (trailing newline per block).
 pub fn render_blocks(blocks: &[Block]) -> String {

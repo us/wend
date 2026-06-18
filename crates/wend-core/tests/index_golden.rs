@@ -2,10 +2,10 @@
 //! idempotency (no duplicates on re-index), and that keyword search works.
 //! Hermetic — uses a tempdir, never `~/.claude`.
 
-use recall_core::index::index_all;
-use recall_core::search::search;
-use recall_core::store::Store;
 use std::path::PathBuf;
+use wend_core::index::index_all;
+use wend_core::search::search;
+use wend_core::store::Store;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -80,7 +80,7 @@ fn reindex_is_idempotent_no_duplicates() {
 
 #[test]
 fn recover_surfaces_pre_compaction_history() {
-    use recall_core::recover::{recover_session, Item};
+    use wend_core::recover::{recover_session, Item};
 
     let (_guard, projects) = temp_projects();
     let mut store = Store::open_in_memory().unwrap();
@@ -182,7 +182,7 @@ fn reindex_after_mutation_leaves_no_orphans() {
 
 #[test]
 fn topology_groups_worktree_sessions() {
-    use recall_core::topology::{build, Confidence};
+    use wend_core::topology::{build, Confidence};
 
     let (_guard, projects) = temp_projects();
     let mut store = Store::open_in_memory().unwrap();

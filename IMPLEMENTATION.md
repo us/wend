@@ -22,22 +22,22 @@ Granular, file-level build plan. Companion to `PLAN.md` (strategy/phases) and `A
 
 ## 1. Workspace layout (lib + bin)
 ```
-session-recall/
+wend/
 ├── Cargo.toml                  # [workspace] + [workspace.dependencies]
 ├── rust-toolchain.toml         # pin stable + rustfmt, clippy; pin zig version for CI
 ├── deny.toml                   # cargo-deny
 ├── .github/workflows/{ci.yml,release.yml}
 ├── fixtures/                   # deterministic Phase-0 corpus (committed, redacted, minimized)
 ├── crates/
-│   ├── recall-core/            # pure engine — NO clap/ratatui, NO stdout. thiserror only.
+│   ├── wend-core/            # pure engine — NO clap/ratatui, NO stdout. thiserror only.
 │   │   └── src/{lib,error,config,model}.rs
 │   │       parser/{mod,content,routing}.rs
 │   │       store/{mod,schema,writer,reader,query}.rs   # query.rs = FTS MATCH compiler/escaper
 │   │       index/mod.rs · search/mod.rs · recover/mod.rs · topology/mod.rs
 │   │       embed/mod.rs        # feature="semantic"
-│   ├── recall-cli/             # binary `recall`
+│   ├── wend-cli/             # binary `wend`
 │   │   └── src/{main,cli,logging}.rs · commands/* · render/* · tui/*  (tui feature)
-│   └── recall-skill/           # later: helpers shared with plugin
+│   └── wend-skill/           # later: helpers shared with plugin
 └── plugin/                     # Claude Code plugin (Phase 7)
     └── .claude-plugin/plugin.json · skills/find/SKILL.md · commands/search.md · hooks/hooks.json · bin/
 ```
@@ -200,16 +200,16 @@ Crates (pin at S0): `candle-core`/`candle-nn`/`candle-transformers` (0.10.x), `t
 
 ---
 
-## 8. CLI / UX (`recall-cli`)
+## 8. CLI / UX (`wend-cli`)
 `clap` derive. ⚠ **Display-id model:** the canonical user-facing id is a **short prefix of the session UUID** (e.g. 8 chars), since `session_id` is unique per top-level file in practice; on collision/ambiguity `show`/`resume`/`name`/`export` print the matching candidates (project + date) and ask the user to disambiguate (longer prefix). Internal PK is never shown. Commands: `index [--embed] [--incremental] [--include-subagents]`, `search <q> [--semantic] [--json] [--since] [--project] [--limit]`, `show <id> [--recovered] [--range/--head/--tail] [--json]`, `tree [project] [--json]`, `resume <id>` (verify cwd exists; emit `cd <cwd> && claude --resume <id>`, never exec), `export <id> --format md|html|json` (renders `content_json`, honors recovery; redaction best-effort/opt-in/preview; `.gitignore` warning), `name <id> <alias>` (writes `custom_title` + syncs `sessions_fts`), `doctor` (DB integrity, SIMD, dirs, model/network/index state, perms). Interactive picker (`tui` feature): `nucleo`+`ratatui`. Output: `comfy-table`, `nu-ansi-term`, OSC-8, `--json`.
 
 ---
 
 ## 9. Plugin (`plugin/`, Phase 7)
-- `plugin.json` (`name:"recall"`); `bin/` on PATH; `${CLAUDE_PLUGIN_ROOT}` for hook paths.
-- **NL skill** `skills/find/SKILL.md`: always-on; tight directive English `description` (≤1,536 chars w/ `when_to_use`; 1–2 Turkish phrases; avoid generic "nerede konuştuk"); `allowed-tools: ["Bash(recall *)"]` — **no exec/Edit/Write** (this is the real injection control; the `<untrusted-data>` wrapper is secondary/soft).
-- ⚠ **Explicit search = a COMMAND, not a `disable-model-invocation` skill.** `commands/search.md` (a slash command `/recall:search`) — because issue #26251 shows `disable-model-invocation:true` can block even slash-invocation of a skill. S8 gate must confirm `/recall:search` actually runs; fallback = rely on the `find` skill alone.
-- **Hook** `hooks/hooks.json`: `SessionStart`(startup)+`UserPromptSubmit` → `bin/hook-index-check.sh`: cheap stat (index age); if stale spawn `nohup recall index --incremental </dev/null >/dev/null 2>&1 & disown`. ⚠ **Must close ALL three FDs incl. stdin (`</dev/null`)** — a background process inheriting the parent's stdin keeps the stream-json pipe open and hangs Claude Code indefinitely after v2.1.87 (#43123). Silent on stdout (it's injected into context; SessionStart blocks and async doesn't apply → detached is the only safe form).
+- `plugin.json` (`name:"wend"`); `bin/` on PATH; `${CLAUDE_PLUGIN_ROOT}` for hook paths.
+- **NL skill** `skills/find/SKILL.md`: always-on; tight directive English `description` (≤1,536 chars w/ `when_to_use`; 1–2 Turkish phrases; avoid generic "nerede konuştuk"); `allowed-tools: ["Bash(wend *)"]` — **no exec/Edit/Write** (this is the real injection control; the `<untrusted-data>` wrapper is secondary/soft).
+- ⚠ **Explicit search = a COMMAND, not a `disable-model-invocation` skill.** `commands/search.md` (a slash command `/wend:search`) — because issue #26251 shows `disable-model-invocation:true` can block even slash-invocation of a skill. S8 gate must confirm `/wend:search` actually runs; fallback = rely on the `find` skill alone.
+- **Hook** `hooks/hooks.json`: `SessionStart`(startup)+`UserPromptSubmit` → `bin/hook-index-check.sh`: cheap stat (index age); if stale spawn `nohup wend index --incremental </dev/null >/dev/null 2>&1 & disown`. ⚠ **Must close ALL three FDs incl. stdin (`</dev/null`)** — a background process inheriting the parent's stdin keeps the stream-json pipe open and hangs Claude Code indefinitely after v2.1.87 (#43123). Silent on stdout (it's injected into context; SessionStart blocks and async doesn't apply → detached is the only safe form).
 
 ---
 
@@ -224,7 +224,7 @@ Crates (pin at S0): `candle-core`/`candle-nn`/`candle-transformers` (0.10.x), `t
 | S5 (Ph4) | `topology` | `tree`+resolver(+cwd cross-validate)+confidence+ghost dirs | correct on known worktree case |
 | S6 (Ph7-lite) | release | `cargo dist`(axodotdev) binaries via zigbuild(universal2)+cross(musl); rcodesign **notarize** (no staple on bare binary); brew/curl | binary runs on clean no-toolchain machine |
 | S7 (fast-follow) | `embed` | semantic: candle(CLS,f32)+chunks+vec_chunks+RRF; musl job uses muslrust | hybrid beats keyword on labeled set |
-| S8 (fast-follow) | `plugin` | find skill + `/recall:search` command + hook; `claude plugin validate` | find fires on intended not generic; **`/recall:search` confirmed invokable** |
+| S8 (fast-follow) | `plugin` | find skill + `/wend:search` command + hook; `claude plugin validate` | find fires on intended not generic; **`/wend:search` confirmed invokable** |
 Cloud (Ph9) parked.
 
 ---
@@ -248,4 +248,4 @@ Cloud (Ph9) parked.
 - **Iteration 0** (2026-06-14): detailed plan from 5-agent research.
 - **Iteration 3 — CONSENSUS** (3 agents + Codex): Schema/SQL **[CONSENSUS]**, Parsing/recovery **[CONSENSUS]** (real-data: 100% message coverage via traverse-all + bridge). Final fixes: **rusqlite/r2d2_sqlite version coupling** — `r2d2_sqlite 0.34` needs `rusqlite ^0.39` (`<0.40`), so pinned **rusqlite 0.39.x** (default) with a hand-rolled-pool alt on 0.40 (Codex 🔴); stray `rusqlite 0.38` in ARCHITECTURE §1 → 0.39; added `sessions_fts` sync triggers to DDL; fixed `directories`→`etcetera` citation. All dimensions consensus.
 - **Iteration 2** (4 agents + Codex): fixed ⚠ `sessions_fts` now external-content over a real `sessions.title` column (was referencing a non-existent column → runtime error); **all other `system/*` must TRAVERSE in DFS** (turn_duration/stop_hook_summary/scheduled_task_fire/… parent real turns — stopping lost 27–72% of messages), not "skip"; **content location by type** (`attachment`→`obj.attachment.content`, `progress`→`obj.data`, not `message.content`); `isCompactSummary` is top-level not under `message`; **hook closes stdin** (`</dev/null`, #43123 hang after v2.1.87); `messages_au` UPDATE trigger guarded both sides; `workflows.parent_session_fk` ON DELETE CASCADE; `foreign_keys=ON` on every connection; `r2d2_sqlite 0.34`/verify single `libsqlite3-sys`; hf-hub `default-features=false`+tokio+rustls-tls; musl wording corrected (core also bundles C, needs build-time C cross-compiler, no runtime system lib). Cross-doc reconciled: **PLAN §105 fastembed→Candle**, ARCHITECTURE `default=[]` (was `["tui"]`), illustrative Cargo.toml rusqlite 0.40 + etcetera, int8→f32/130 MB, cargo-dist axodotdev.
-- **Iteration 1** (5 agents + Codex): fixed ⚠ **forest roots = ALL parent_uuid==null + traverse all node types** (real-data: was losing 1471/1555 msgs); content in `message.content`; **always store rows, omit only empty FTS**; **subagent scope pinned** (topology-only by default, `--include-subagents` opt-in) + glob disambiguation; **idempotent per-file replacement** + ON DELETE CASCADE + explicit vec/relations cleanup + idempotency test; **chunk-level embeddings** (`chunks`+`vec_chunks`, was wrongly message-keyed); rusqlite real version + r2d2 match; sqlite-vec 3-arg signature; PRAGMA split (writer WAL, readers read-only, `pragma_update`, `busy_timeout`); `sessions_fts` external-content (snippet works); **FTS MATCH query compiler/escaping**; ordered parallel reduction; routing for attachment/progress; cross-file orphan fallback; topology cwd cross-validation; display-id model; hf-hub 0.5.0/`with_cache_dir`+rustls-tls; candle f32 + musl-onig C-toolchain caveat; cargo-dist upstream axodotdev; rcodesign notarize-not-staple; `/recall:search` as command not disable-model-invocation skill (#26251); default features lean (tui opt-in); split CI feature matrix; timestamp parsing; file lock + busy_timeout. ARCHITECTURE §3/§4 (int8→f32, 33MB→130MB) and §7 (astral→axodotdev) to be corrected.
+- **Iteration 1** (5 agents + Codex): fixed ⚠ **forest roots = ALL parent_uuid==null + traverse all node types** (real-data: was losing 1471/1555 msgs); content in `message.content`; **always store rows, omit only empty FTS**; **subagent scope pinned** (topology-only by default, `--include-subagents` opt-in) + glob disambiguation; **idempotent per-file replacement** + ON DELETE CASCADE + explicit vec/relations cleanup + idempotency test; **chunk-level embeddings** (`chunks`+`vec_chunks`, was wrongly message-keyed); rusqlite real version + r2d2 match; sqlite-vec 3-arg signature; PRAGMA split (writer WAL, readers read-only, `pragma_update`, `busy_timeout`); `sessions_fts` external-content (snippet works); **FTS MATCH query compiler/escaping**; ordered parallel reduction; routing for attachment/progress; cross-file orphan fallback; topology cwd cross-validation; display-id model; hf-hub 0.5.0/`with_cache_dir`+rustls-tls; candle f32 + musl-onig C-toolchain caveat; cargo-dist upstream axodotdev; rcodesign notarize-not-staple; `/wend:search` as command not disable-model-invocation skill (#26251); default features lean (tui opt-in); split CI feature matrix; timestamp parsing; file lock + busy_timeout. ARCHITECTURE §3/§4 (int8→f32, 33MB→130MB) and §7 (astral→axodotdev) to be corrected.

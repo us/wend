@@ -38,34 +38,34 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
-        run: cargo build --release --locked -p recall-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p wend-cli --target ${{ matrix.target }}
       - name: Verify musl binary is static
         if: matrix.musl
         run: |
-          file target/${{ matrix.target }}/release/recall
-          ldd target/${{ matrix.target }}/release/recall 2>&1 | grep -q "not a dynamic executable" \
+          file target/${{ matrix.target }}/release/wend
+          ldd target/${{ matrix.target }}/release/wend 2>&1 | grep -q "not a dynamic executable" \
             && echo "OK: static" || (echo "FAIL: not static" && exit 1)
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf "$GITHUB_WORKSPACE/recall-${{ matrix.target }}.tar.gz" recall
+          tar czf "$GITHUB_WORKSPACE/wend-${{ matrix.target }}.tar.gz" wend
           cd "$GITHUB_WORKSPACE"
-          shasum -a 256 "recall-${{ matrix.target }}.tar.gz" > "recall-${{ matrix.target }}.tar.gz.sha256"
+          shasum -a 256 "wend-${{ matrix.target }}.tar.gz" > "wend-${{ matrix.target }}.tar.gz.sha256"
       - name: Package (windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a "$env:GITHUB_WORKSPACE/recall-${{ matrix.target }}.zip" recall.exe
+          7z a "$env:GITHUB_WORKSPACE/wend-${{ matrix.target }}.zip" wend.exe
           cd "$env:GITHUB_WORKSPACE"
-          (Get-FileHash "recall-${{ matrix.target }}.zip" -Algorithm SHA256).Hash > "recall-${{ matrix.target }}.zip.sha256"
+          (Get-FileHash "wend-${{ matrix.target }}.zip" -Algorithm SHA256).Hash > "wend-${{ matrix.target }}.zip.sha256"
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            recall-${{ matrix.target }}.tar.gz
-            recall-${{ matrix.target }}.tar.gz.sha256
-            recall-${{ matrix.target }}.zip
-            recall-${{ matrix.target }}.zip.sha256
+            wend-${{ matrix.target }}.tar.gz
+            wend-${{ matrix.target }}.tar.gz.sha256
+            wend-${{ matrix.target }}.zip
+            wend-${{ matrix.target }}.zip.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

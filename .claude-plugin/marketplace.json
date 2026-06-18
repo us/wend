@@ -1,10 +1,10 @@
 {
-  "name": "recall",
-  "description": "session-recall: search, recover, and resume your past Claude Code sessions from local history.",
+  "name": "wend",
+  "description": "wend: search, recover, and resume your past Claude Code sessions from local history.",
   "owner": { "name": "us" },
   "plugins": [
     {
-      "name": "recall",
+      "name": "wend",
       "source": "./plugin",
       "description": "Find, recover, and resume your past Claude Code sessions — keyword search, pre-compaction recovery, and worktree topology."
     }

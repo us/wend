@@ -2132,34 +2132,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "recall-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "recall-core",
- "serde_json",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "recall-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "etcetera",
- "fastembed",
- "rayon",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "redox_users"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3205,6 +3177,34 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+
+[[package]]
+name = "wend-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "wend-core",
+]
+
+[[package]]
+name = "wend-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "etcetera",
+ "fastembed",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "winapi"

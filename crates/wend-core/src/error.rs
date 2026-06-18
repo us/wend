@@ -1,7 +1,7 @@
 //! Typed error surface for the core engine. Libraries return `Error`; the CLI
 //! wraps these with `anyhow` context.
 
-/// Result alias used throughout `recall-core`.
+/// Result alias used throughout `wend-core`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// All failure modes the core engine can surface.
