@@ -1,0 +1,5 @@
+# Canonicalize commit identities. Left = how it should display; trailing
+# <email> = the email as recorded in commits to remap.
+# All commits were authored with deepkod@gmail.com (GitHub account
+# "permissiontest"); they are the same person as "us".
+us <rahmetsaritekin@gmail.com> <deepkod@gmail.com>
