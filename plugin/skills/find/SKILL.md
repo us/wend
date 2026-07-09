@@ -12,6 +12,9 @@ sessions using the local `wend` CLI (read-only over `~/.claude/projects`).
 ## Flow
 1. Turn the request into a query and run:
    `wend search "<query>" --json --limit 10`
+   — add `--role user` or `--role assistant` to match only one side of the
+   conversation (what the user typed vs. what the model said). Tool output isn't
+   a role — it lives inside user/assistant messages and can't be filtered out.
 2. Present results as a numbered list (title · project · snippet). Use each
    result's `session_id` for follow-ups. If nothing fits, refine the query.
 3. Read one: `wend show <session_id> --head 40`
