@@ -24,7 +24,14 @@ pub fn compile_query(input: &str) -> Option<String> {
 
 /// Run a keyword search, returning at most `limit` results — **one per session**
 /// (the best-matching message). Returns empty for an empty query.
-pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+/// `role`, when set (`"user"` / `"assistant"`), restricts matches to messages of
+/// that role. Titles have no role, so the title tier is skipped when it's set.
+pub fn search(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    role: Option<&str>,
+) -> Result<Vec<SearchHit>> {
     let Some(match_query) = compile_query(query) else {
         return Ok(Vec::new());
     };
@@ -35,11 +42,13 @@ pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>
     let mut seen = std::collections::HashSet::new();
     let mut grouped = Vec::with_capacity(limit);
 
-    for hit in store.search_titles_raw(&match_query, limit)? {
-        if seen.insert(hit.session_id.clone()) {
-            grouped.push(hit);
-            if grouped.len() >= limit {
-                return Ok(grouped);
+    if role.is_none() {
+        for hit in store.search_titles_raw(&match_query, limit)? {
+            if seen.insert(hit.session_id.clone()) {
+                grouped.push(hit);
+                if grouped.len() >= limit {
+                    return Ok(grouped);
+                }
             }
         }
     }
@@ -49,7 +58,7 @@ pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>
     // let min>max (a `clamp(limit, CAP)` panics when limit>CAP).
     const RAW_CAP: usize = 50_000;
     let raw_limit = limit.saturating_mul(20).max(limit).min(RAW_CAP);
-    for hit in store.search_raw(&match_query, raw_limit)? {
+    for hit in store.search_raw(&match_query, raw_limit, role)? {
         if seen.insert(hit.session_id.clone()) {
             grouped.push(hit);
             if grouped.len() >= limit {

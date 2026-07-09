@@ -1,7 +1,26 @@
 //! Command-line surface. Subcommands are scaffolded here and filled in across
 //! the build steps (index → search → show → recover → tree → …).
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Restrict a search to one side of the conversation.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RoleFilter {
+    /// Only messages you typed.
+    User,
+    /// Only the model's replies.
+    Assistant,
+}
+
+impl RoleFilter {
+    /// The `role` value as stored in the index.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            RoleFilter::User => "user",
+            RoleFilter::Assistant => "assistant",
+        }
+    }
+}
 
 /// wend: find, recover, and visualize your Claude Code session history.
 #[derive(Debug, Parser)]
@@ -39,9 +58,27 @@ pub enum Command {
         /// Emit machine-readable JSON (for the skill).
         #[arg(long)]
         json: bool,
+        /// Only match messages from one side: `user` or `assistant`.
+        #[arg(long, value_enum)]
+        role: Option<RoleFilter>,
         /// Max results.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Dump your own typed messages across all sessions, in flow order.
+    ///
+    /// Real prompts only — tool results, system reminders, and slash commands
+    /// are excluded (same filter the semantic index uses). For self-analysis.
+    Messages {
+        /// Which side to dump (default: user — what you typed).
+        #[arg(long, value_enum, default_value = "user")]
+        role: RoleFilter,
+        /// Emit machine-readable JSON (for the skill).
+        #[arg(long)]
+        json: bool,
+        /// Cap the number of messages (default: no cap — dump everything).
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Show a session transcript by id.
     Show {

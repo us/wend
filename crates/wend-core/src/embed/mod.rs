@@ -159,7 +159,7 @@ pub fn hybrid_search(store: &Store, query: &str, limit: usize) -> Result<Vec<Sea
     use std::collections::HashMap;
 
     let over = limit.saturating_mul(3).max(limit);
-    let keyword = crate::search::search(store, query, over)?;
+    let keyword = crate::search::search(store, query, over, None)?;
 
     // Semantic: score every chunk, keep the best chunk per session.
     let mut semantic: Vec<SearchHit> = Vec::new();

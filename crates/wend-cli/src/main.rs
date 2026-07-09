@@ -54,15 +54,22 @@ fn run(args: Cli) -> Result<()> {
             query,
             semantic,
             json,
+            role,
             limit,
         } => {
             let db = config::index_db_path()?;
             let store =
                 Store::open(&db).with_context(|| format!("opening index at {}", db.display()))?;
+            let role = role.map(|r| r.as_db_str());
             let hits = if semantic {
+                if role.is_some() {
+                    tracing::warn!(
+                        "--role only applies to keyword search; ignored with --semantic"
+                    );
+                }
                 run_semantic(&store, &query, limit)?
             } else {
-                search::search(&store, &query, limit)?
+                search::search(&store, &query, limit, role)?
             };
             if json {
                 println!("{}", serde_json::to_string(&hits)?);
@@ -81,6 +88,33 @@ fn run(args: Cli) -> Result<()> {
                     };
                     println!("{}. [{}] {} · {}", i + 1, h.project, title, h.session_id);
                     println!("    {}", h.snippet);
+                }
+            }
+            Ok(())
+        }
+
+        Command::Messages { role, json, limit } => {
+            let store = open_store()?;
+            let msgs = store.list_prose_messages(role.as_db_str(), limit)?;
+            if json {
+                println!("{}", serde_json::to_string(&msgs)?);
+            } else {
+                // Group by session so the conversation flow stays legible.
+                let mut cur = String::new();
+                for m in &msgs {
+                    if m.session_id != cur {
+                        let title = if m.title.is_empty() {
+                            "(untitled)"
+                        } else {
+                            &m.title
+                        };
+                        println!("\n── {} · {} · {} ──", title, m.project, m.session_id);
+                        cur = m.session_id.clone();
+                    }
+                    println!("{}", m.text);
+                }
+                if msgs.is_empty() {
+                    println!("no messages — run `wend index` first");
                 }
             }
             Ok(())
@@ -353,7 +387,7 @@ fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHi
 #[cfg(not(feature = "semantic"))]
 fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
     tracing::warn!("--semantic needs a build with --features semantic; keyword only");
-    Ok(search::search(store, query, limit)?)
+    Ok(search::search(store, query, limit, None)?)
 }
 
 /// Resolve a short session-id prefix to exactly one session, or report candidates.

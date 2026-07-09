@@ -43,13 +43,60 @@ fn indexes_fixture_and_search_finds_it() {
     );
 
     // keyword search hits the indexed content
-    let hits = search(&store, "gradient", 10).unwrap();
+    let hits = search(&store, "gradient", 10, None).unwrap();
     assert!(!hits.is_empty(), "expected a match for 'gradient'");
     assert!(hits.iter().any(|h| h.session_id == "basic_session"));
 
     // thinking text must not be searchable
-    let secret = search(&store, "private reasoning", 10).unwrap();
+    let secret = search(&store, "private reasoning", 10, None).unwrap();
     assert!(secret.is_empty(), "thinking blocks must not be indexed");
+}
+
+#[test]
+fn role_filter_restricts_matches_to_one_side() {
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+
+    // "explosion" is only in the user's message; "Picking" only in the
+    // assistant's. Each term must be found under its own role and hidden under
+    // the other. (Note: a tool_result rides in a user-role message, so the tool
+    // output "clip_grad_norm_" is user-side here — tool content isn't a role.)
+    assert!(!search(&store, "explosion", 10, Some("user"))
+        .unwrap()
+        .is_empty());
+    assert!(search(&store, "explosion", 10, Some("assistant"))
+        .unwrap()
+        .is_empty());
+    assert!(!search(&store, "Picking", 10, Some("assistant"))
+        .unwrap()
+        .is_empty());
+    assert!(search(&store, "Picking", 10, Some("user"))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn list_prose_messages_dumps_typed_prompts_only() {
+    let (_guard, projects) = temp_projects();
+    let mut store = Store::open_in_memory().unwrap();
+    index_all(&mut store, &projects, false).unwrap();
+
+    let msgs = store.list_prose_messages("user", None).unwrap();
+    let texts: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
+
+    // The user's real typed prompt is dumped...
+    assert!(texts.iter().any(|t| t.contains("gradient explosion")));
+    // ...but a tool_result riding in a user-role message is NOT (not typed prose).
+    assert!(
+        !texts.iter().any(|t| t.contains("clip_grad_norm_")),
+        "tool output must not leak into the typed-prompt dump"
+    );
+    // ...and the assistant side is excluded from a user dump.
+    assert!(!texts.iter().any(|t| t.contains("Picking")));
+
+    // limit caps the total.
+    assert!(store.list_prose_messages("user", Some(1)).unwrap().len() <= 1);
 }
 
 #[test]
@@ -68,7 +115,7 @@ fn reindex_is_idempotent_no_duplicates() {
     assert_eq!(store.message_count().unwrap(), messages_after_first);
 
     // Search still returns exactly one session (no duplicate rows).
-    let hits = search(&store, "gradient", 50).unwrap();
+    let hits = search(&store, "gradient", 50, None).unwrap();
     let distinct_sessions: std::collections::HashSet<_> =
         hits.iter().map(|h| h.session_id.clone()).collect();
     assert_eq!(distinct_sessions.len(), 1);
@@ -133,13 +180,13 @@ fn name_makes_session_findable_by_alias() {
     // A token that appears nowhere in the fixture's message content.
     let alias = "qqzz-unique-alias-token";
     assert!(
-        search(&store, alias, 5).unwrap().is_empty(),
+        search(&store, alias, 5, None).unwrap().is_empty(),
         "precondition: alias token must not exist in message bodies"
     );
 
     store.set_custom_title(sess.pk, alias).unwrap();
 
-    let hits = search(&store, alias, 5).unwrap();
+    let hits = search(&store, alias, 5, None).unwrap();
     assert!(
         hits.iter().any(|h| h.session_id == "basic_session"),
         "after naming, the session must be findable by its alias (title search)"
@@ -160,7 +207,7 @@ fn reindex_after_mutation_leaves_no_orphans() {
 
     let mut store = Store::open_in_memory().unwrap();
     index_all(&mut store, &projects, false).unwrap();
-    assert!(!search(&store, "gradient", 10).unwrap().is_empty());
+    assert!(!search(&store, "gradient", 10, None).unwrap().is_empty());
 
     // Mutate: replace the file with a tiny 2-message session.
     std::fs::write(
@@ -174,8 +221,10 @@ fn reindex_after_mutation_leaves_no_orphans() {
     assert_eq!(store.session_count().unwrap(), 1);
     assert_eq!(store.message_count().unwrap(), 2, "old messages gone");
     // Old content no longer searchable → no orphan FTS rows.
-    assert!(search(&store, "gradient", 10).unwrap().is_empty());
-    assert!(!search(&store, "different topic", 10).unwrap().is_empty());
+    assert!(search(&store, "gradient", 10, None).unwrap().is_empty());
+    assert!(!search(&store, "different topic", 10, None)
+        .unwrap()
+        .is_empty());
     assert_eq!(store.foreign_key_violations().unwrap(), 0);
     store.fts_integrity_check().unwrap();
 }
@@ -216,7 +265,7 @@ fn huge_limit_does_not_panic() {
     let (_guard, projects) = temp_projects();
     let mut store = Store::open_in_memory().unwrap();
     index_all(&mut store, &projects, false).unwrap();
-    let hits = search(&store, "gradient", 10_000_000).unwrap();
+    let hits = search(&store, "gradient", 10_000_000, None).unwrap();
     assert!(hits.len() <= 1, "only one session in the fixture");
 }
 
@@ -236,11 +285,13 @@ fn alias_survives_full_reindex() {
     store
         .set_custom_title(sess.pk, "keepme-alias-token")
         .unwrap();
-    assert!(!search(&store, "keepme-alias-token", 5).unwrap().is_empty());
+    assert!(!search(&store, "keepme-alias-token", 5, None)
+        .unwrap()
+        .is_empty());
 
     // FULL reindex (not incremental) must NOT wipe the alias.
     index_all(&mut store, &projects, false).unwrap();
-    let hits = search(&store, "keepme-alias-token", 5).unwrap();
+    let hits = search(&store, "keepme-alias-token", 5, None).unwrap();
     assert!(
         hits.iter().any(|h| h.session_id == "basic_session"),
         "alias must survive a full re-index"

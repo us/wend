@@ -83,6 +83,17 @@ pub struct WorktreeInfo {
     pub continues_session_id: Option<String>,
 }
 
+/// One typed message for the flow dump (`wend messages`, self-analysis).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ProseMessage {
+    pub session_id: String,
+    pub project: String,
+    pub title: String,
+    pub ts: Option<i64>,
+    pub line_no: i64,
+    pub text: String,
+}
+
 /// A stored compaction-boundary row, for recovery.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundaryRow {
@@ -389,16 +400,7 @@ impl Store {
              ORDER BY rank
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![match_query, limit as i64], |r| {
-            Ok(SearchHit {
-                session_id: r.get(0)?,
-                title: r.get(1)?,
-                project: r.get(2)?,
-                line_no: r.get(3)?,
-                snippet: r.get(4)?,
-                rank: r.get(5)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![match_query, limit as i64], hit_from_row)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -470,6 +472,50 @@ impl Store {
              ORDER BY line_no",
         )?;
         let rows = stmt.query_map(params![session_pk], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Dump typed prose messages for one `role` across ALL sessions, in flow
+    /// order (session by first activity, then line order). Same "real prompt"
+    /// filter as [`Self::semantic_messages`], plus: no subagent turns
+    /// (`is_sidechain`) and no bracketed system/attachment markers (`[request
+    /// interrupted…]`, `[image: …]`). First block is text, no tool results /
+    /// system reminders (`<…>`) / slash commands (`/…`). `limit` caps the total;
+    /// `None` dumps everything.
+    pub fn list_prose_messages(
+        &self,
+        role: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<ProseMessage>> {
+        let limit_clause = if limit.is_some() { " LIMIT ?2" } else { "" };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.session_id, COALESCE(s.project_name,''), COALESCE(s.title,''),
+                    m.ts, m.line_no, m.text_for_fts
+             FROM messages m JOIN sessions s ON s.id = m.session_fk
+             WHERE m.role = ?1 AND m.text_for_fts <> '' AND m.is_sidechain = 0
+               AND m.content_json LIKE '[{{\"kind\":\"text\"%'
+               AND m.text_for_fts NOT LIKE '<%' AND m.text_for_fts NOT LIKE '/%'
+               AND m.text_for_fts NOT LIKE '[%'
+             ORDER BY s.first_ts, s.id, m.line_no{limit_clause}"
+        ))?;
+        let map = |r: &rusqlite::Row| {
+            Ok(ProseMessage {
+                session_id: r.get(0)?,
+                project: r.get(1)?,
+                title: r.get(2)?,
+                ts: r.get(3)?,
+                line_no: r.get(4)?,
+                text: r.get(5)?,
+            })
+        };
+        let rows = match limit {
+            Some(n) => stmt.query_map(params![role, n as i64], map)?,
+            None => stmt.query_map(params![role], map)?,
+        };
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -626,8 +672,22 @@ impl Store {
     /// [`crate::search::compile_query`]). Grouping to one-per-session happens in
     /// [`crate::search::search`] — FTS5 aux functions can't be nested in SQL
     /// aggregates, so dedup is done in Rust over this ordered stream.
-    pub fn search_raw(&self, match_query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let mut stmt = self.conn.prepare(
+    /// `role`, when set (`"user"` / `"assistant"`), restricts hits to messages
+    /// with that role — the prose you typed vs. what the model said. Tool
+    /// content isn't a role (it's blocks flattened into the user/assistant
+    /// message's FTS body), so it can't be isolated here.
+    pub fn search_raw(
+        &self,
+        match_query: &str,
+        limit: usize,
+        role: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
+        let role_clause = if role.is_some() {
+            " AND m.role = ?3"
+        } else {
+            ""
+        };
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''),
                     m.line_no,
                     snippet(messages_fts, 0, '[', ']', '…', 12),
@@ -635,20 +695,14 @@ impl Store {
              FROM messages_fts
              JOIN messages m ON m.id = messages_fts.rowid
              JOIN sessions s ON s.id = m.session_fk
-             WHERE messages_fts MATCH ?1
+             WHERE messages_fts MATCH ?1{role_clause}
              ORDER BY rank
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![match_query, limit as i64], |r| {
-            Ok(SearchHit {
-                session_id: r.get(0)?,
-                title: r.get(1)?,
-                project: r.get(2)?,
-                line_no: r.get(3)?,
-                snippet: r.get(4)?,
-                rank: r.get(5)?,
-            })
-        })?;
+             LIMIT ?2"
+        ))?;
+        let rows = match role {
+            Some(role) => stmt.query_map(params![match_query, limit as i64, role], hit_from_row)?,
+            None => stmt.query_map(params![match_query, limit as i64], hit_from_row)?,
+        };
         let mut hits = Vec::new();
         for row in rows {
             hits.push(row?);
@@ -659,6 +713,18 @@ impl Store {
 
 /// Bump when the parser's output shape changes (forces a re-parse on next index).
 pub const PARSER_VERSION: i64 = 1;
+
+/// Build a [`SearchHit`] from a search row (columns in the shared select order).
+fn hit_from_row(r: &rusqlite::Row) -> rusqlite::Result<SearchHit> {
+    Ok(SearchHit {
+        session_id: r.get(0)?,
+        title: r.get(1)?,
+        project: r.get(2)?,
+        line_no: r.get(3)?,
+        snippet: r.get(4)?,
+        rank: r.get(5)?,
+    })
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
