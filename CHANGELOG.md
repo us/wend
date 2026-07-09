@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0](https://github.com/us/wend/compare/v0.1.0...v0.2.0) (2026-07-09)
+
+
+### Features
+
+* **cli:** add --role filter and messages command ([96900ec](https://github.com/us/wend/commit/96900ec95b46425061f1a2e99ce79d39bd8e4269))
+* **plugin:** add profile and skill-forge skills ([ebefe28](https://github.com/us/wend/commit/ebefe28b685674a762ce1e98e31646b8f79dac17))
+
+
+### Bug Fixes
+
+* **ci:** accept static-pie as static for musl binary check ([150b34a](https://github.com/us/wend/commit/150b34aec57cb17f789aaa66c244eff28afa5f03))
+
 ## 0.1.0 (2026-06-18)
 
 
