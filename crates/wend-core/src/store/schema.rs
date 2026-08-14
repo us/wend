@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version (stored in `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// v2: session-level embedding vectors (superseded by chunk-level in v3).
 const SCHEMA_V2: &str = r#"
@@ -40,6 +40,49 @@ CREATE TABLE IF NOT EXISTS chunk_vectors(
   vec BLOB NOT NULL,
   model TEXT,
   built_at INTEGER);
+"#;
+
+/// v4: force one rebuild of every chunk. `chunk_texts` used to measure a message
+/// in bytes but hard-split it on that many *chars*, so 64% of real chunks
+/// overshot the 1200-byte target (max seen: 2431 B ≈ 767 tokens) and were
+/// silently truncated by the 512-token local model. Fixing the chunker doesn't
+/// repair chunks already on disk — `sessions_without_chunks` only re-chunks
+/// sessions with zero rows — so wipe them once and let the next `--embed`
+/// rebuild.
+///
+/// Both tables are deleted explicitly rather than leaning on the cascade:
+/// `foreign_keys` is switched on in `Store::open`, not in this function, which
+/// is public and called directly (including by our own tests) on a bare
+/// connection where the cascade would not fire and would strand vectors whose
+/// `chunk_fk` a rebuilt chunk could reuse.
+const SCHEMA_V4: &str = r#"
+DELETE FROM chunk_vectors;
+DELETE FROM chunks;
+"#;
+
+/// v5: the case library shares the `chunks` table rather than getting its own.
+///
+/// A *case* is a chunk whose `text` is a situation (what the agent had just done)
+/// and whose `payload` is the user's verbatim reaction to it. Reusing `chunks`
+/// means the embedding pipeline — model guard, batch writer, resume logic — works
+/// on cases unmodified, because it only ever reads `chunks.text`.
+///
+/// Wrapped in an explicit transaction: `execute_batch` hands the whole string to
+/// SQLite where each DDL statement autocommits, and `ALTER TABLE ADD COLUMN` has
+/// no `IF NOT EXISTS`. Without this, an interruption after the first `ALTER`
+/// would leave the file at v4 with one column added, and every retry would die
+/// on "duplicate column name".
+/// The version bump is *inside* the transaction. Committing the DDL first and
+/// stamping the version afterwards leaves the same hole one level up: a crash
+/// between the two gives a file that has the columns but still says v4, and
+/// every later open re-runs the `ALTER`s and dies on "duplicate column name".
+const SCHEMA_V5: &str = r#"
+BEGIN;
+ALTER TABLE chunks ADD COLUMN kind TEXT NOT NULL DEFAULT 'prose';
+ALTER TABLE chunks ADD COLUMN payload TEXT;
+ALTER TABLE chunks ADD COLUMN src_message_fk INTEGER;
+PRAGMA user_version = 5;
+COMMIT;
 "#;
 
 const SCHEMA_V1: &str = r#"
@@ -140,8 +183,22 @@ END;
 "#;
 
 /// Apply pending migrations. Idempotent: safe to call on every open.
+///
+/// Refuses to open an index written by a newer build. Without that check the
+/// unconditional `user_version` write below would *downgrade* the stamp, and the
+/// next new-enough binary would replay a destructive migration (v4 wipes every
+/// chunk) — for the Azure backend that means paying to re-embed the whole
+/// corpus each time an older `wend` touches the file.
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+            Some(format!(
+                "index was written by a newer wend (schema v{version}, this build knows v{SCHEMA_VERSION}); upgrade wend"
+            )),
+        ));
+    }
     if version < 1 {
         conn.execute_batch(SCHEMA_V1)?;
     }
@@ -151,7 +208,15 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if version < 3 {
         conn.execute_batch(SCHEMA_V3)?;
     }
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    if version < 4 {
+        conn.execute_batch(SCHEMA_V4)?;
+    }
+    if version < 5 {
+        conn.execute_batch(SCHEMA_V5)?;
+    }
+    if version < SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     Ok(())
 }
 
@@ -168,6 +233,90 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// v4 must actually wipe pre-existing chunks *and* their vectors, so the
+    /// fixed chunker rebuilds them. Both deletes are explicit rather than relying
+    /// on the cascade, because `migrate` runs on connections where
+    /// `foreign_keys` was never switched on — as here.
+    #[test]
+    fn v4_wipes_chunks_built_by_the_old_chunker() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.pragma_update(None, "user_version", 3_i64).unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO sessions(id, session_id, title) VALUES (1,'s1','t');
+             INSERT INTO chunks(id, session_fk, ordinal, text) VALUES (10,1,0,'stale oversized chunk');
+             INSERT INTO chunk_vectors(chunk_fk, dim, dtype, vec, model, built_at)
+               VALUES (10, 384, 'f32', x'00000000', 'multilingual-e5-small', 1);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let chunks: i64 = conn
+            .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        let vecs: i64 = conn
+            .query_row("SELECT count(*) FROM chunk_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks, 0, "stale chunks must be wiped");
+        assert_eq!(vecs, 0, "orphaned vectors must be wiped too");
+        // The session itself must survive — only chunks are rebuilt.
+        let sessions: i64 = conn
+            .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1);
+    }
+
+    /// v5 must add its columns to a populated v4 database without disturbing the
+    /// rows already there, and existing chunks must come out as `kind='prose'`
+    /// so they stay visible to ordinary semantic search.
+    #[test]
+    fn v5_adds_case_columns_without_touching_existing_chunks() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.pragma_update(None, "user_version", 4_i64).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions(id, session_id, title) VALUES (1,'s1','t');
+             INSERT INTO chunks(id, session_fk, ordinal, text) VALUES (7,1,0,'existing prose');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (kind, payload, text): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT kind, payload, text FROM chunks WHERE id=7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "prose", "pre-v5 chunks must default to prose");
+        assert_eq!(payload, None);
+        assert_eq!(text, "existing prose", "existing rows must survive intact");
+    }
+
+    /// An index written by a newer build must be refused, not silently stamped
+    /// back down — a downgrade would make the next new binary replay v4 and wipe
+    /// (and, on the Azure backend, re-bill) every chunk.
+    #[test]
+    fn migrate_refuses_a_newer_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+
+        assert!(migrate(&conn).is_err());
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "must not downgrade the stamp");
     }
 
     /// Regression: an intermediate dev build created the chunk tables but left

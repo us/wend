@@ -1,31 +1,181 @@
-//! Local semantic search (opt-in `semantic` feature) — CHUNK level via fastembed.
+//! Semantic search over CHUNK-level embeddings, with two interchangeable
+//! backends (both opt-in features; the default build has neither and stays
+//! offline).
 //!
-//! Each session is split into message-aligned text chunks (the user's own prompts;
-//! assistant/tool/log turns excluded — what *you asked* defines the topic and
-//! keeps the corpus small/fast). Every chunk is embedded with `fastembed`
-//! (ONNX Runtime — fast CPU throughput) using the multilingual
-//! `multilingual-e5-small` model (384-d, good Turkish). Search embeds the query,
-//! scores chunks by cosine (= dot; fastembed L2-normalizes), rolls chunks up to
-//! their session (max chunk score), and fuses with keyword via RRF.
+//! Each session is split into message-aligned text chunks (the user's own
+//! prompts; assistant/tool/log turns excluded — what *you asked* defines the
+//! topic and keeps the corpus small/fast). Search embeds the query, scores
+//! chunks by cosine (= dot; both backends emit L2-normalized vectors), rolls
+//! chunks up to their session (max chunk score), and fuses with keyword via RRF.
 //!
-//! e5 is asymmetric: documents get a `passage:` prefix, queries a `query:` prefix.
+//! Backends:
+//! - `semantic`: local `fastembed` / ONNX, `multilingual-e5-small` (384-d).
+//!   e5 is asymmetric, so documents get a `passage:` prefix and queries a
+//!   `query:` prefix. Offline, free, and measurably weaker.
+//! - `azure`: Azure OpenAI `text-embedding-3-large` at 1024-d. Symmetric — it
+//!   must NOT get the e5 prefixes. Sends text off-machine; see [`azure`].
+//!
+//! Measured on the author's real corpus (500 prompts, 34 Turkish queries):
+//! Azure MRR@10 0.771, local e5-small 0.381, keyword-only 0.000.
+
+#[cfg(feature = "azure")]
+pub mod azure;
+pub mod cases;
 
 use crate::error::{Error, Result};
 use crate::store::{ChunkVec, SearchHit, Store};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-const MODEL_NAME: &str = "multilingual-e5-small";
-/// Target chunk size in bytes — conservative for multi-byte (Turkish) text so we
-/// stay under the model's 512-token limit (fastembed truncates as a safety net).
+/// Target chunk size in bytes.
 const CHUNK_BYTES: usize = 1200;
 
+/// How many chunks go into one embedding request.
+const BATCH: usize = 96;
+
+#[cfg(feature = "semantic")]
 fn err<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> Error + '_ {
     move |e| Error::InvalidData(format!("{ctx}: {e}"))
 }
 
-/// How many CPU threads embedding may use. Gentle by default (~a quarter of the
-/// cores) so a full embed doesn't pin the whole machine; override with
+/// Which backend this process will use, resolved from the environment *without*
+/// loading anything expensive.
+///
+/// Split from [`Embedder`] on purpose: the model id is needed to ask the store
+/// what still needs embedding, and answering "nothing" should not have cost a
+/// multi-hundred-MB model download first.
+enum Selection {
+    #[cfg(feature = "semantic")]
+    Local,
+    #[cfg(feature = "azure")]
+    Azure(azure::Config),
+}
+
+/// Resolve the backend from the environment.
+///
+/// Azure wins when configured. Partial Azure configuration is a hard error and
+/// never a quiet fallback to local: falling back would treat every Azure vector
+/// as stale and overwrite the whole corpus with local vectors on the next
+/// `--embed`, silently trading 0.771 for 0.381 (and the cost of re-embedding)
+/// because of one typo'd variable.
+fn select() -> Result<Selection> {
+    #[cfg(feature = "azure")]
+    {
+        if let Some(cfg) = azure::Config::from_env()? {
+            return Ok(Selection::Azure(cfg));
+        }
+    }
+    #[cfg(feature = "semantic")]
+    {
+        Ok(Selection::Local)
+    }
+    #[cfg(not(feature = "semantic"))]
+    {
+        Err(Error::InvalidData(
+            "no embedding backend configured: this build has only the Azure backend, \
+             so set WEND_AZURE_ENDPOINT, WEND_AZURE_KEY and WEND_AZURE_DEPLOYMENT"
+                .into(),
+        ))
+    }
+}
+
+impl Selection {
+    fn model_id(&self) -> String {
+        match self {
+            #[cfg(feature = "semantic")]
+            Selection::Local => LOCAL_MODEL.to_string(),
+            #[cfg(feature = "azure")]
+            Selection::Azure(cfg) => cfg.model_id(),
+        }
+    }
+}
+
+/// The model id the current environment will embed with. Used as the storage key
+/// so vectors from different models never get compared to each other.
+pub fn current_model_id() -> Result<String> {
+    Ok(select()?.model_id())
+}
+
+/// Which backend is active. A type rather than a string so callers branch on a
+/// variant instead of prefix-matching a display name that anyone could reword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Local,
+    Azure,
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Backend::Local => "local (fastembed)",
+            Backend::Azure => "azure",
+        })
+    }
+}
+
+/// The backend this environment resolves to, for `wend doctor` and messaging.
+pub fn active_backend() -> Result<Backend> {
+    Ok(match select()? {
+        #[cfg(feature = "semantic")]
+        Selection::Local => Backend::Local,
+        #[cfg(feature = "azure")]
+        Selection::Azure(_) => Backend::Azure,
+    })
+}
+
+/// A loaded embedding backend.
+///
+/// Every method is a `match` whose arms mirror the variant `cfg`s exactly. Miss
+/// one and the build breaks only in a single-feature configuration — which is
+/// why the test matrix compiles all four combinations.
+pub enum Embedder {
+    /// Boxed: the loaded ONNX session is ~1.2 KB inline, which would make every
+    /// `Embedder` that size even on the Azure path.
+    #[cfg(feature = "semantic")]
+    Local(Box<Local>),
+    #[cfg(feature = "azure")]
+    Azure(azure::Azure),
+}
+
+impl Embedder {
+    /// Load the selected backend, downloading/caching the local model on first use.
+    pub fn load() -> Result<Self> {
+        match select()? {
+            #[cfg(feature = "semantic")]
+            Selection::Local => Ok(Self::Local(Box::new(Local::load()?))),
+            #[cfg(feature = "azure")]
+            Selection::Azure(cfg) => Ok(Self::Azure(azure::Azure::new(cfg)?)),
+        }
+    }
+
+    /// Embed documents. Both backends return L2-normalized vectors.
+    pub fn embed_passages(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        match self {
+            #[cfg(feature = "semantic")]
+            Self::Local(m) => m.embed_passages(texts),
+            #[cfg(feature = "azure")]
+            Self::Azure(a) => a.embed_passages(texts),
+        }
+    }
+
+    /// Embed a single query.
+    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
+        match self {
+            #[cfg(feature = "semantic")]
+            Self::Local(m) => m.embed_query(query),
+            #[cfg(feature = "azure")]
+            Self::Azure(a) => a.embed_query(query),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- local backend
+
+#[cfg(feature = "semantic")]
+const LOCAL_MODEL: &str = "multilingual-e5-small";
+
+/// How many CPU threads local embedding may use. Gentle by default (~a quarter
+/// of the cores) so a full embed doesn't pin the whole machine; override with
 /// `WEND_EMBED_THREADS`. ONNX Runtime would otherwise grab every core.
+#[cfg(feature = "semantic")]
 pub fn embed_threads() -> usize {
     if let Ok(v) = std::env::var("WEND_EMBED_THREADS") {
         if let Ok(n) = v.parse::<usize>() {
@@ -38,14 +188,16 @@ pub fn embed_threads() -> usize {
     (cores / 4).max(1)
 }
 
-/// A loaded embedding model.
-pub struct Embedder {
-    model: TextEmbedding,
+/// Local fastembed backend.
+#[cfg(feature = "semantic")]
+pub struct Local {
+    model: fastembed::TextEmbedding,
 }
 
-impl Embedder {
-    /// Load the model, downloading + caching it on first use.
-    pub fn load() -> Result<Self> {
+#[cfg(feature = "semantic")]
+impl Local {
+    fn load() -> Result<Self> {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
         let cache = crate::config::model_cache_dir()?;
         std::fs::create_dir_all(&cache)?;
         let model = TextEmbedding::try_new(
@@ -58,14 +210,12 @@ impl Embedder {
         Ok(Self { model })
     }
 
-    /// Embed passages (documents). fastembed L2-normalizes the output.
-    pub fn embed_passages(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_passages(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let docs: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
         self.model.embed(docs, None).map_err(err("embed"))
     }
 
-    /// Embed a single query.
-    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
+    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
         self.model
             .embed(vec![format!("query: {query}")], None)
             .map_err(err("embed query"))?
@@ -74,8 +224,31 @@ impl Embedder {
     }
 }
 
+// -------------------------------------------------------------------- chunking
+
+/// Split one oversized message into ≤`CHUNK_BYTES` pieces on char boundaries.
+///
+/// Measures bytes, not chars. The previous version tested `m.len()` (bytes) but
+/// then cut on `CHUNK_BYTES` *chars*, so multi-byte text overshot badly: on the
+/// author's real corpus 64% of chunks exceeded the 1200-byte target, topping out
+/// at 2431 B (~767 tokens) — well past the local model's 512-token window, where
+/// fastembed silently truncates.
+fn hard_split(m: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in m.chars() {
+        if !cur.is_empty() && cur.len() + ch.len_utf8() > CHUNK_BYTES {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(ch);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Split ordered message texts into message-aligned, ~`CHUNK_BYTES` chunks.
-/// An oversized single message is hard-split (on char boundaries).
 fn chunk_texts(msgs: &[String]) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut cur = String::new();
@@ -88,13 +261,7 @@ fn chunk_texts(msgs: &[String]) -> Vec<String> {
             if !cur.is_empty() {
                 chunks.push(std::mem::take(&mut cur));
             }
-            let chars: Vec<char> = m.chars().collect();
-            let mut i = 0;
-            while i < chars.len() {
-                let end = (i + CHUNK_BYTES).min(chars.len());
-                chunks.push(chars[i..end].iter().collect());
-                i = end;
-            }
+            chunks.extend(hard_split(m));
             continue;
         }
         if !cur.is_empty() && cur.len() + 1 + m.len() > CHUNK_BYTES {
@@ -111,34 +278,58 @@ fn chunk_texts(msgs: &[String]) -> Vec<String> {
     chunks
 }
 
-/// Chunk any un-chunked sessions, then embed any chunks without a vector.
-/// Returns `(chunks_created, chunks_embedded)`. Resume-safe.
-pub fn build_index(store: &mut Store) -> Result<(usize, usize)> {
+// ------------------------------------------------------------------- indexing
+
+/// Chunk any un-chunked sessions. Returns how many chunks were created.
+///
+/// Split from [`embed_pending`] so a caller can chunk first, ask how much work
+/// that produced, and tell the user what it will cost *before* spending money —
+/// counting pending vectors before chunking always reports zero on a fresh index.
+pub fn build_chunks(store: &mut Store) -> Result<usize> {
     let mut created = 0;
-    for pk in store.sessions_without_chunks()? {
+    for pk in store.sessions_without_chunks("prose")? {
         let msgs = store.semantic_messages(pk)?;
-        for (i, text) in chunk_texts(&msgs).into_iter().enumerate() {
-            store.insert_chunk(pk, i as i64, &text)?;
-            created += 1;
+        let chunks = chunk_texts(&msgs);
+        if !chunks.is_empty() {
+            created += store.insert_session_chunks(pk, &chunks)?;
         }
+    }
+    Ok(created)
+}
+
+/// Embed every chunk lacking a vector for the current model. Resume-safe.
+pub fn embed_pending(store: &mut Store) -> Result<usize> {
+    let model = current_model_id()?;
+    // `None`: every kind. Prose chunks and cases share the pipeline, and
+    // filtering to one here would leave the other permanently unembedded.
+    let pending = store.chunks_needing_vectors(&model, None)?;
+    if pending.is_empty() {
+        return Ok(0);
     }
 
-    let pending = store.chunks_needing_vectors()?;
-    if pending.is_empty() {
-        return Ok((created, 0));
-    }
     let mut embedder = Embedder::load()?;
     let mut embedded = 0;
-    for batch in pending.chunks(256) {
+    for batch in pending.chunks(BATCH) {
         let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
         let vectors = embedder.embed_passages(&texts)?;
-        for ((cid, _), v) in batch.iter().zip(vectors.iter()) {
-            store.store_chunk_vector(*cid, MODEL_NAME, v)?;
-            embedded += 1;
+        if vectors.len() != batch.len() {
+            return Err(Error::InvalidData(format!(
+                "backend returned {} vectors for {} inputs",
+                vectors.len(),
+                batch.len()
+            )));
         }
+        let rows: Vec<(i64, Vec<f32>)> = batch
+            .iter()
+            .map(|(cid, _)| *cid)
+            .zip(vectors)
+            .collect::<Vec<_>>();
+        embedded += store.store_chunk_vectors_batch(&model, &rows)?;
     }
-    Ok((created, embedded))
+    Ok(embedded)
 }
+
+// --------------------------------------------------------------------- search
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -161,14 +352,24 @@ pub fn hybrid_search(store: &Store, query: &str, limit: usize) -> Result<Vec<Sea
     let over = limit.saturating_mul(3).max(limit);
     let keyword = crate::search::search(store, query, over, None)?;
 
-    // Semantic: score every chunk, keep the best chunk per session.
+    // Semantic: score every chunk embedded by the *current* model, keep the best
+    // chunk per session.
+    let model = current_model_id()?;
     let mut semantic: Vec<SearchHit> = Vec::new();
-    let chunks = store.all_chunk_vectors()?;
+    // Prose only: cases hold situation text, which would pollute ordinary search.
+    let chunks = store.all_chunk_vectors(&model, "prose")?;
     if !chunks.is_empty() {
         let mut embedder = Embedder::load()?;
         let qv = embedder.embed_query(query)?;
         let mut best: HashMap<String, (f32, ChunkVec)> = HashMap::new();
         for c in chunks {
+            if c.vec.len() != qv.len() {
+                return Err(Error::InvalidData(format!(
+                    "stored vector is {}-d but the query is {}-d — run `wend index --embed`",
+                    c.vec.len(),
+                    qv.len()
+                )));
+            }
             let s = dot(&qv, &c.vec);
             best.entry(c.session_id.clone())
                 .and_modify(|e| {
@@ -237,5 +438,31 @@ mod tests {
         );
         assert!(chunk_texts(&["x".repeat(CHUNK_BYTES * 2 + 10)]).len() >= 3);
         assert!(chunk_texts(&["".to_string(), "  ".to_string()]).is_empty());
+    }
+
+    /// Regression: chunks are capped in BYTES, not chars. Turkish is ~1.6 bytes
+    /// per char, so the old char-based split produced chunks up to 2431 B and
+    /// blew past the local model's 512-token window.
+    #[test]
+    fn chunks_never_exceed_the_byte_cap() {
+        let turkish = "çğıöşü ÇĞİÖŞÜ birazcık daha uzun bir cümle olsun diye ".repeat(200);
+        assert!(turkish.len() > CHUNK_BYTES * 4, "test input must be big");
+        for c in chunk_texts(&[turkish]) {
+            assert!(
+                c.len() <= CHUNK_BYTES,
+                "chunk was {} bytes, cap is {CHUNK_BYTES}",
+                c.len()
+            );
+        }
+    }
+
+    /// A multi-byte char must never be split across two chunks.
+    #[test]
+    fn hard_split_keeps_chars_intact() {
+        let s = "ş".repeat(CHUNK_BYTES);
+        for c in super::hard_split(&s) {
+            assert!(c.chars().all(|ch| ch == 'ş'));
+            assert!(c.len() <= CHUNK_BYTES);
+        }
     }
 }

@@ -73,6 +73,40 @@ pub struct ChunkVec {
     pub vec: Vec<f32>,
 }
 
+/// A case awaiting insertion: what the agent had just done, and what the user
+/// said back, verbatim.
+#[derive(Debug, Clone)]
+pub struct NewCase {
+    pub situation: String,
+    pub reaction: String,
+    /// `messages.id` of the reaction, for provenance and its timestamp.
+    pub src_message_fk: i64,
+}
+
+/// An embedded case, ready to rank.
+#[derive(Debug, Clone)]
+pub struct CaseVec {
+    pub id: i64,
+    pub session_id: String,
+    pub project: String,
+    pub situation: String,
+    pub reaction: String,
+    pub ts: Option<i64>,
+    pub vec: Vec<f32>,
+}
+
+/// One raw transcript row, with the fields the turn assembler needs.
+#[derive(Debug, Clone)]
+pub struct TurnRow {
+    pub id: i64,
+    pub line_no: i64,
+    pub role: String,
+    pub ts: Option<i64>,
+    pub content_json: String,
+    pub is_sidechain: bool,
+    pub is_compact_summary: bool,
+}
+
 /// A worktree-state record linking a session to its origin repo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorktreeInfo {
@@ -448,11 +482,22 @@ impl Store {
     }
 
     /// Session pks that have no chunks yet (need chunking before embedding).
-    pub fn sessions_without_chunks(&self) -> Result<Vec<i64>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM sessions WHERE id NOT IN (SELECT session_fk FROM chunks)")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
+    /// Session pks with no chunks **of this kind** yet.
+    ///
+    /// Kind-aware on purpose: it used to test for any chunk at all, so once a
+    /// session had cases it would never be prose-chunked again (or vice versa),
+    /// silently shrinking whichever index ran second.
+    pub fn sessions_without_chunks(&self, kind: &str) -> Result<Vec<i64>> {
+        // Chronological: case building dedups reactions globally and keeps the
+        // first one it sees, so "first seen" has to mean "said earliest".
+        // Unordered, a later restatement processed first would suppress the
+        // original — and once suppressed it never reappears.
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM sessions
+             WHERE id NOT IN (SELECT session_fk FROM chunks WHERE kind = ?1)
+             ORDER BY first_ts ASC NULLS LAST, id ASC",
+        )?;
+        let rows = stmt.query_map(params![kind], |r| r.get(0))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -524,20 +569,75 @@ impl Store {
     }
 
     /// Insert a chunk, returning its id.
-    pub fn insert_chunk(&mut self, session_pk: i64, ordinal: i64, text: &str) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO chunks(session_fk, ordinal, text) VALUES (?1,?2,?3)",
-            params![session_pk, ordinal, text],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+    /// Insert one session's complete chunk set in a single transaction.
+    ///
+    /// Atomic on purpose: [`Self::sessions_without_chunks`] only resurfaces
+    /// sessions with *zero* chunk rows, so a crash partway through a row-at-a-time
+    /// insert would leave that session permanently half-chunked — it never looks
+    /// unfinished again, and the rest of its messages stay unsearchable forever.
+    pub fn insert_session_chunks(&mut self, session_pk: i64, texts: &[String]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chunks(session_fk, ordinal, text, kind) VALUES (?1,?2,?3,'prose')",
+            )?;
+            for (ordinal, text) in texts.iter().enumerate() {
+                stmt.execute(params![session_pk, ordinal as i64, text])?;
+            }
+        }
+        tx.commit()?;
+        Ok(texts.len())
     }
 
-    /// Chunks that still need an embedding (id + text). Resume-safe.
-    pub fn chunks_needing_vectors(&self) -> Result<Vec<(i64, String)>> {
+    /// Insert one session's complete case set in a single transaction.
+    ///
+    /// Atomic for the same reason prose chunking is: [`Self::sessions_without_chunks`]
+    /// only resurfaces sessions with zero rows of the kind, so a half-written
+    /// session would never look unfinished again.
+    pub fn insert_session_cases(&mut self, session_pk: i64, cases: &[NewCase]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chunks(session_fk, ordinal, text, kind, payload, src_message_fk)
+                 VALUES (?1,?2,?3,'case',?4,?5)",
+            )?;
+            for (ordinal, c) in cases.iter().enumerate() {
+                stmt.execute(params![
+                    session_pk,
+                    ordinal as i64,
+                    c.situation,
+                    c.reaction,
+                    c.src_message_fk
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(cases.len())
+    }
+
+    /// Every embedded case, with the payload and provenance `ChunkVec` lacks.
+    pub fn case_vectors(&self, model: &str) -> Result<Vec<CaseVec>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, text FROM chunks WHERE id NOT IN (SELECT chunk_fk FROM chunk_vectors)",
+            "SELECT c.id, s.session_id, COALESCE(s.project_name,''), c.text,
+                    COALESCE(c.payload,''), m.ts, v.vec
+             FROM chunk_vectors v
+             JOIN chunks c   ON c.id = v.chunk_fk
+             JOIN sessions s ON s.id = c.session_fk
+             LEFT JOIN messages m ON m.id = c.src_message_fk
+             WHERE v.model IS ?1 AND c.kind = 'case'",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map(params![model], |r| {
+            let blob: Vec<u8> = r.get(6)?;
+            Ok(CaseVec {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                project: r.get(2)?,
+                situation: r.get(3)?,
+                reaction: r.get(4)?,
+                ts: r.get(5)?,
+                vec: bytes_to_f32(&blob),
+            })
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -545,33 +645,136 @@ impl Store {
         Ok(out)
     }
 
-    /// Store a chunk's embedding vector.
-    pub fn store_chunk_vector(&mut self, chunk_id: i64, model: &str, vec: &[f32]) -> Result<()> {
-        let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
-        self.conn.execute(
-            "INSERT INTO chunk_vectors(chunk_fk, dim, dtype, vec, model, built_at)
-             VALUES (?1,?2,'f32',?3,?4,?5)
-             ON CONFLICT(chunk_fk) DO UPDATE SET
-                dim=excluded.dim, vec=excluded.vec, model=excluded.model, built_at=excluded.built_at",
-            params![chunk_id, vec.len() as i64, blob, model, now_ms()],
-        )?;
-        Ok(())
-    }
-
-    /// Number of embedded chunks.
-    pub fn chunk_vector_count(&self) -> Result<i64> {
-        Ok(self
+    /// Every reaction already stored as a case, for cross-session dedup.
+    pub fn existing_case_reactions(&self) -> Result<Vec<String>> {
+        let mut stmt = self
             .conn
-            .query_row("SELECT COUNT(*) FROM chunk_vectors", [], |r| r.get(0))?)
+            .prepare("SELECT COALESCE(payload,'') FROM chunks WHERE kind='case'")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
-    /// All chunk vectors + metadata, for brute-force semantic search.
-    pub fn all_chunk_vectors(&self) -> Result<Vec<ChunkVec>> {
+    /// Raw rows for one session, in line order, for the turn assembler.
+    ///
+    /// Distinct from [`Self::session_messages`] because the assembler needs the
+    /// row id (case provenance) and `is_sidechain` (so subagent turns are not
+    /// spliced into a main-thread case), neither of which that accessor exposes.
+    pub fn session_turn_rows(&self, session_pk: i64) -> Result<Vec<TurnRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, line_no, COALESCE(role,''), ts, COALESCE(content_json,'[]'),
+                    COALESCE(is_sidechain,0), COALESCE(is_compact_summary,0)
+             FROM messages WHERE session_fk=?1 ORDER BY line_no",
+        )?;
+        let rows = stmt.query_map(params![session_pk], |r| {
+            Ok(TurnRow {
+                id: r.get(0)?,
+                line_no: r.get(1)?,
+                role: r.get(2)?,
+                ts: r.get(3)?,
+                content_json: r.get(4)?,
+                is_sidechain: r.get::<_, i64>(5)? != 0,
+                is_compact_summary: r.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Chunks that still need an embedding under `model` (id + text). Resume-safe.
+    ///
+    /// Covers both "never embedded" and "embedded by a different model", so
+    /// switching backends re-embeds instead of silently mixing incompatible
+    /// vector spaces. `IS NOT` rather than `<>` so a NULL `model` also counts as
+    /// stale (SQLite's `<>` yields NULL there, which would never match).
+    ///
+    /// `kind` filters to one chunk kind; `None` means every kind, which is what
+    /// the backfill wants — miss it and one kind is never embedded and never
+    /// costed.
+    pub fn chunks_needing_vectors(
+        &self,
+        model: &str,
+        kind: Option<&str>,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.text FROM chunks c
+             LEFT JOIN chunk_vectors v ON v.chunk_fk = c.id
+             WHERE (v.chunk_fk IS NULL OR v.model IS NOT ?1)
+               AND (?2 IS NULL OR c.kind = ?2)",
+        )?;
+        let rows = stmt.query_map(params![model, kind], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Store a batch of chunk vectors in a single transaction.
+    ///
+    /// Batched because a full backfill is ~20k rows and autocommit-per-row is
+    /// the dominant cost. The transaction deliberately covers only these writes,
+    /// never the network call that produced them — holding a write txn open
+    /// across a multi-second retry backoff buys nothing.
+    pub fn store_chunk_vectors_batch(
+        &mut self,
+        model: &str,
+        vectors: &[(i64, Vec<f32>)],
+    ) -> Result<usize> {
+        let ts = now_ms();
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chunk_vectors(chunk_fk, dim, dtype, vec, model, built_at)
+                 VALUES (?1,?2,'f32',?3,?4,?5)
+                 ON CONFLICT(chunk_fk) DO UPDATE SET
+                    dim=excluded.dim, vec=excluded.vec,
+                    model=excluded.model, built_at=excluded.built_at",
+            )?;
+            for (chunk_id, vec) in vectors {
+                let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+                stmt.execute(params![chunk_id, vec.len() as i64, blob, model, ts])?;
+            }
+        }
+        tx.commit()?;
+        Ok(vectors.len())
+    }
+
+    /// Number of chunks embedded under `model` (`None` = every model).
+    pub fn chunk_vector_count(&self, model: Option<&str>) -> Result<i64> {
+        Ok(match model {
+            Some(m) => self.conn.query_row(
+                "SELECT COUNT(*) FROM chunk_vectors WHERE model IS ?1",
+                params![m],
+                |r| r.get(0),
+            )?,
+            None => self
+                .conn
+                .query_row("SELECT COUNT(*) FROM chunk_vectors", [], |r| r.get(0))?,
+        })
+    }
+
+    /// All chunk vectors + metadata for `model`, for brute-force semantic search.
+    ///
+    /// Filtering by model is a correctness requirement, not a nicety: `dot()`
+    /// zips to the shorter of the two vectors, so scoring a 1024-d query against
+    /// a leftover 384-d vector yields a plausible-looking but meaningless number
+    /// rather than an error.
+    /// `kind` keeps cases out of ordinary prose search and vice versa — without
+    /// it `wend search --semantic` would start returning situation text.
+    pub fn all_chunk_vectors(&self, model: &str, kind: &str) -> Result<Vec<ChunkVec>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''), c.text, v.vec
-             FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_fk JOIN sessions s ON s.id=c.session_fk",
+             FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_fk JOIN sessions s ON s.id=c.session_fk
+             WHERE v.model IS ?1 AND c.kind = ?2",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![model, kind], |r| {
             let blob: Vec<u8> = r.get(4)?;
             Ok(ChunkVec {
                 session_id: r.get(0)?,

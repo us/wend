@@ -3198,12 +3198,14 @@ dependencies = [
  "etcetera",
  "fastembed",
  "rayon",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
+ "ureq",
 ]
 
 [[package]]
