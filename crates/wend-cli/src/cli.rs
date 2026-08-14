@@ -65,6 +65,21 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Find how you reacted in similar past situations.
+    ///
+    /// Describe what an agent just did, and this returns what you actually said
+    /// the last times you faced something like it — verbatim, with provenance.
+    /// Evidence, not authority: it never stands in for your approval.
+    Recall {
+        /// The current situation: what the agent did or is proposing.
+        situation: String,
+        /// Emit machine-readable JSON (for the skill).
+        #[arg(long)]
+        json: bool,
+        /// Max precedents.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
     /// Dump your own typed messages across all sessions, in flow order.
     ///
     /// Real prompts only — tool results, system reminders, and slash commands

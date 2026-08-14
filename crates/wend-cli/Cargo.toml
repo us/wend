@@ -15,6 +15,7 @@ path = "src/main.rs"
 default = []
 tui = []        # interactive picker (nucleo + ratatui), wired in a later step
 semantic = ["wend-core/semantic"] # local embeddings (fastembed/ONNX, opt-in)
+azure = ["wend-core/azure"]       # remote embeddings (Azure OpenAI, opt-in)
 
 [dependencies]
 wend-core.workspace = true

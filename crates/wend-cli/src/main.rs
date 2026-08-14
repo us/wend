@@ -93,6 +93,12 @@ fn run(args: Cli) -> Result<()> {
             Ok(())
         }
 
+        Command::Recall {
+            situation,
+            json,
+            limit,
+        } => run_recall(&situation, json, limit),
+
         Command::Messages { role, json, limit } => {
             let store = open_store()?;
             let msgs = store.list_prose_messages(role.as_db_str(), limit)?;
@@ -130,17 +136,7 @@ fn run(args: Cli) -> Result<()> {
                 let store = Store::open(&db)?;
                 println!("sessions:     {}", store.session_count()?);
                 println!("messages:     {}", store.message_count()?);
-                let embedded = store.chunk_vector_count().unwrap_or(0);
-                let semantic_build = cfg!(feature = "semantic");
-                println!(
-                    "semantic:     {} ({} chunk(s) embedded)",
-                    if semantic_build {
-                        "built-in"
-                    } else {
-                        "not in this build (rebuild with --features semantic)"
-                    },
-                    embedded
-                );
+                println!("semantic:     {}", semantic_status(&store));
             } else {
                 println!("index:        not built — run `wend index`");
             }
@@ -361,32 +357,178 @@ fn open_store() -> Result<Store> {
     Store::open(&db).with_context(|| format!("opening index at {}", db.display()))
 }
 
-#[cfg(feature = "semantic")]
+/// One-line semantic status for `doctor`: which backend this build+environment
+/// resolves to, and how many chunks are embedded *under that backend's model*.
+/// A count taken across all models would claim the index is ready right after a
+/// backend switch, when in fact none of those vectors are usable.
+#[cfg(any(feature = "semantic", feature = "azure"))]
+fn semantic_status(store: &Store) -> String {
+    // Both come from the same `select()`, so if the model id resolved, so does
+    // the backend — the `?`-free shape here just keeps `doctor` printing a
+    // useful line instead of aborting when nothing is configured.
+    match (
+        wend_core::embed::current_model_id(),
+        wend_core::embed::active_backend(),
+    ) {
+        (Ok(model), Ok(backend)) => {
+            let n = store.chunk_vector_count(Some(&model)).unwrap_or(0);
+            let other = store.chunk_vector_count(None).unwrap_or(0) - n;
+            let stale = if other > 0 {
+                format!(", {other} from another model — rerun `wend index --embed`")
+            } else {
+                String::new()
+            };
+            format!("{backend} [{model}] ({n} chunk(s) embedded{stale})")
+        }
+        (Err(e), _) | (_, Err(e)) => format!("built-in but not configured: {e}"),
+    }
+}
+
+#[cfg(not(any(feature = "semantic", feature = "azure")))]
+fn semantic_status(store: &Store) -> String {
+    format!(
+        "not in this build (rebuild with --features semantic or --features azure) \
+         ({} chunk(s) embedded)",
+        store.chunk_vector_count(None).unwrap_or(0)
+    )
+}
+
+#[cfg(any(feature = "semantic", feature = "azure"))]
+fn run_recall(situation: &str, json: bool, limit: usize) -> Result<()> {
+    use wend_core::embed::cases::{recall, Recall};
+
+    let store = open_store()?;
+    match recall(&store, situation, limit)? {
+        Recall::NoPrecedent { best, floor } => {
+            if json {
+                // Same top-level shape as the found branch: a consumer must not
+                // have to switch on whether it got an object or an array.
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "precedents": [],
+                        "abstained": true,
+                        "best_relevance": best,
+                        "floor": floor,
+                    })
+                );
+            } else {
+                println!(
+                    "no confident precedent (best {best:.2} < floor {floor:.2}) — \
+                     roughly a quarter of reactions start a new topic rather than \
+                     answering the last one, and this looks like one of those"
+                );
+            }
+        }
+        Recall::Found(ps) => {
+            if json {
+                let rows: Vec<_> = ps
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "session_id": p.session_id, "project": p.project,
+                            "situation": p.situation, "reaction": p.reaction,
+                            "relevance": p.relevance, "diagnosticity": p.diagnosticity,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({ "precedents": rows, "abstained": false })
+                );
+            } else {
+                // Printed weakest-first: the most diagnostic precedent is last,
+                // where it carries the most weight in whatever reads this.
+                for p in &ps {
+                    println!(
+                        "rel {:.2} diag {:.2} · {} · {}",
+                        p.relevance, p.diagnosticity, p.project, p.session_id
+                    );
+                    println!("  then: …{}", tail(&p.situation, 160));
+                    println!("  said: {}\n", p.reaction);
+                }
+                // Framed as standards rather than a forecast on purpose: measured
+                // over 477 held-out probes, these do NOT predict which way the
+                // user will go (no better than random), but they do surface the
+                // criteria he raises. See evals/RESULTS.md.
+                println!(
+                    "{} precedent(s) — standards he has applied here before, \
+                     not a prediction of what he'll say, and not his approval.",
+                    ps.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(feature = "semantic", feature = "azure")))]
+fn run_recall(_situation: &str, _json: bool, _limit: usize) -> Result<()> {
+    anyhow::bail!("recall needs a build with --features semantic (or azure)")
+}
+
+/// Last `n` chars, without splitting a multi-byte character.
+#[cfg(any(feature = "semantic", feature = "azure"))]
+fn tail(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    s.chars().skip(count.saturating_sub(n)).collect()
+}
+
+#[cfg(any(feature = "semantic", feature = "azure"))]
 fn run_embed(store: &mut Store) -> Result<()> {
-    let threads = wend_core::embed::embed_threads();
-    eprintln!(
-        "building semantic index — CPU-bound, using {threads} thread(s) \
-         (set WEND_EMBED_THREADS to change; first run also downloads the model)…"
-    );
-    let (created, embedded) = wend_core::embed::build_index(store)?;
+    use wend_core::embed;
+
+    let backend = embed::active_backend()?;
+
+    // Chunk first: on a fresh index nothing is chunked yet, so counting pending
+    // work before this would report zero and quote a $0.00 estimate.
+    let created = embed::build_chunks(store)? + embed::cases::build_cases(store)?;
+    let pending = store
+        .chunks_needing_vectors(&embed::current_model_id()?, None)?
+        .len();
+
+    // Only the local backend is CPU-bound and thread-tunable; saying so on the
+    // Azure path would be nonsense.
+    #[cfg(feature = "semantic")]
+    if backend == embed::Backend::Local {
+        eprintln!(
+            "building semantic index via {backend} — {pending} chunk(s), CPU-bound, \
+             using {} thread(s) (set WEND_EMBED_THREADS to change; first run also \
+             downloads the model)…",
+            embed::embed_threads()
+        );
+    }
+    if backend == embed::Backend::Azure {
+        // Azure bills per token, so say what this will cost before spending it.
+        // 344 tokens/chunk is the measured mean over a real corpus.
+        let tokens = pending as f64 * 344.0;
+        eprintln!(
+            "building semantic index via {backend} — {pending} chunk(s), \
+             ~{:.2}M token(s), ~${:.2}; text is redacted before it leaves this machine…",
+            tokens / 1e6,
+            tokens / 1e6 * 0.13
+        );
+    }
+
+    let embedded = embed::embed_pending(store)?;
     println!("semantic: {created} new chunk(s) created, {embedded} embedded");
     Ok(())
 }
 
-#[cfg(not(feature = "semantic"))]
+#[cfg(not(any(feature = "semantic", feature = "azure")))]
 fn run_embed(_store: &mut Store) -> Result<()> {
-    tracing::warn!("--embed needs a build with --features semantic; skipping");
+    tracing::warn!("--embed needs a build with --features semantic (or azure); skipping");
     Ok(())
 }
 
-#[cfg(feature = "semantic")]
+#[cfg(any(feature = "semantic", feature = "azure"))]
 fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
     Ok(wend_core::embed::hybrid_search(store, query, limit)?)
 }
 
-#[cfg(not(feature = "semantic"))]
+#[cfg(not(any(feature = "semantic", feature = "azure")))]
 fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-    tracing::warn!("--semantic needs a build with --features semantic; keyword only");
+    tracing::warn!("--semantic needs a build with --features semantic (or azure); keyword only");
     Ok(search::search(store, query, limit, None)?)
 }
 

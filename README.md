@@ -15,6 +15,11 @@ lets you:
 Everything is local and read-only over your transcripts; the only state it writes
 is its own index (`~/.local/share/wend/index.db`, `0600`).
 
+The default build makes no network calls at all. One opt-in feature can:
+`--features azure` sends prompt text to an Azure OpenAI endpoint **you** own, and
+only when you have set all three `WEND_AZURE_*` variables. See
+[Semantic search](#semantic-search).
+
 ## Install
 
 **One-liner** (prebuilt binary, macOS + Linux):
@@ -40,10 +45,70 @@ cargo install --path crates/wend-cli   # puts `wend` on your PATH
 wend index                             # build the index (~15s for ~200 sessions, then incremental)
 wend doctor                            # check status
 
-# optional: semantic (meaning-based) search — heavier build (ONNX Runtime)
+# optional: semantic (meaning-based) search — see below for the two backends
 cargo install --path crates/wend-cli --features semantic
 wend index --embed                     # downloads the e5 model once, embeds your prompts
 ```
+
+## Semantic search
+
+`wend search --semantic` fuses keyword (BM25) with vector similarity over your
+own prompts. Two opt-in backends; the default build has neither.
+
+| build | backend | where your text goes |
+|---|---|---|
+| *(default)* | none — keyword only | — |
+| `--features semantic` | `multilingual-e5-small` via ONNX | stays on your machine |
+| `--features azure` | Azure OpenAI `text-embedding-3-large` | your own Azure resource |
+
+Measured on one real corpus (757 sessions, 20k chunks) with 34 natural-language
+Turkish queries written to share no wording with the message they target — the
+realistic case where you remember the topic, not the words. Two different
+things were measured, and they are not interchangeable:
+
+**Backend comparison** (rank 500 candidate messages, identical harness):
+
+| backend | MRR@10 |
+|---|---:|
+| Azure `text-embedding-3-large` @1024 | 0.771 |
+| local `multilingual-e5-small` @384 | 0.381 |
+| keyword only | 0.000 |
+
+**End to end** (`wend search --semantic` against the whole index, does the exact
+session you meant come back): top-1 24%, top-5 50%, top-10 56%, MRR 0.350 — versus
+**0.000 for keyword search**, which returns nothing at all for a natural-language
+query because every term is ANDed together. The end-to-end number is lower
+because picking one session out of 757 is much harder than picking one message
+out of 500, and because many sessions are genuinely about the same topic.
+
+Your numbers will differ. The harness is in `plans/`.
+
+The Azure backend is inert until all three variables are set:
+
+```bash
+export WEND_AZURE_ENDPOINT=https://<your-account>.cognitiveservices.azure.com/
+export WEND_AZURE_KEY=<key>
+export WEND_AZURE_DEPLOYMENT=<your-embedding-deployment>
+wend index --embed
+```
+
+Setting only some of them is an error rather than a silent fallback, because
+falling back would overwrite every Azure vector in your index.
+
+**What leaves your machine.** Only the prompts *you typed* (never tool output or
+transcripts of Claude's replies), and only when you run `wend index --embed` or
+`wend search --semantic`. Text is scanned for secrets first — AWS keys, GitHub /
+GitLab / npm / Slack / Google / SendGrid tokens, `sk-`-style API keys, JWTs,
+bearer tokens, `*_TOKEN`/`*_SECRET`/`*_API_KEY` assignments, private-key blocks
+(including fragments split across chunks), and URIs with inline credentials —
+and those are replaced before the request is built.
+
+That is pattern matching, not a guarantee: it raises the floor, it cannot
+promise nothing sensitive ever escapes. On the corpus it was developed against
+it caught 29 of 29 detectable secrets while altering 0.3% of ordinary prompts,
+but your history is not that history. Cost is roughly $0.13 per million tokens;
+a 20k-chunk history is about $0.90 once and ~18 minutes, then pennies
+incrementally.
 
 ## Use
 
