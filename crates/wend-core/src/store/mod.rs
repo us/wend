@@ -953,3 +953,45 @@ fn restrict_perms(path: &Path) {
         let _ = std::fs::set_permissions(path, perms);
     }
 }
+
+impl Store {
+    /// Compaction summaries for a session, oldest first.
+    ///
+    /// Claude Code writes one whenever a session runs out of context; each is a
+    /// structured account of the goal and what is still open. They have always
+    /// been stored and never read.
+    pub fn compact_summaries(&self, session_pk: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT text_for_fts FROM messages
+             WHERE session_fk=?1 AND is_compact_summary=1 AND text_for_fts<>''
+             ORDER BY line_no",
+        )?;
+        let rows = stmt.query_map(params![session_pk], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The first thing the user actually typed in a session.
+    ///
+    /// The fallback when there is no compaction summary, and the only claim that
+    /// can be made honestly without one: this is what they opened with.
+    pub fn first_spoken_message(&self, session_pk: i64) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT text_for_fts FROM messages
+             WHERE session_fk=?1 AND type='user' AND is_sidechain=0
+               AND COALESCE(is_compact_summary,0)=0
+               AND content_json LIKE '[{\"kind\":\"text\"%'
+               AND text_for_fts NOT LIKE '<%' AND text_for_fts NOT LIKE '/%'
+               AND length(text_for_fts) > 20
+             ORDER BY line_no LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![session_pk], |r| r.get::<_, String>(0))?;
+        Ok(match rows.next() {
+            Some(r) => Some(r?),
+            None => None,
+        })
+    }
+}

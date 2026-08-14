@@ -11,6 +11,7 @@ pub mod error;
 pub mod index;
 pub mod model;
 pub mod parser;
+pub mod recap;
 pub mod recover;
 pub mod search;
 pub mod store;
