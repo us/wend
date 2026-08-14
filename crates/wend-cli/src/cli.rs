@@ -80,6 +80,21 @@ pub enum Command {
         #[arg(long, default_value_t = 8)]
         limit: usize,
     },
+    /// What a session was for, and what it left open.
+    ///
+    /// Reads the compaction summaries Claude Code already wrote — they record
+    /// the original request and the pending tasks. Sessions that never compacted
+    /// only get their opening message, because anything more would be guesswork.
+    Recap {
+        /// Session id or a unique prefix.
+        id: String,
+        /// Show every parsed section, not just intent and pending work.
+        #[arg(long)]
+        full: bool,
+        /// Emit machine-readable JSON (for the skill).
+        #[arg(long)]
+        json: bool,
+    },
     /// Dump your own typed messages across all sessions, in flow order.
     ///
     /// Real prompts only — tool results, system reminders, and slash commands

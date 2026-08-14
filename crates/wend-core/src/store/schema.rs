@@ -184,11 +184,12 @@ END;
 
 /// Apply pending migrations. Idempotent: safe to call on every open.
 ///
-/// Refuses to open an index written by a newer build. Without that check the
-/// unconditional `user_version` write below would *downgrade* the stamp, and the
-/// next new-enough binary would replay a destructive migration (v4 wipes every
-/// chunk) — for the Azure backend that means paying to re-embed the whole
-/// corpus each time an older `wend` touches the file.
+/// Refuses an index written by a newer build, and only ever raises the stamp.
+/// Without this an older binary silently rewrites `user_version` downward, and
+/// the next newer binary replays every migration in between — which, once any of
+/// them is destructive, deletes real data. That is not hypothetical: it happened
+/// during development, wiping a 28k-row chunk index that had cost real money to
+/// embed, because two worktrees at different schema versions shared one file.
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > SCHEMA_VERSION {
@@ -223,6 +224,23 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An index written by a newer build must be refused, not stamped backwards.
+    /// A downgrade makes the next newer binary replay migrations it has already
+    /// applied — destructive ones included.
+    #[test]
+    fn migrate_refuses_a_newer_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 2)
+            .unwrap();
+
+        assert!(migrate(&conn).is_err(), "must refuse a newer index");
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 2, "must not rewrite the stamp downward");
+    }
 
     #[test]
     fn migrate_is_idempotent_on_fresh_db() {
@@ -300,23 +318,6 @@ mod tests {
         assert_eq!(kind, "prose", "pre-v5 chunks must default to prose");
         assert_eq!(payload, None);
         assert_eq!(text, "existing prose", "existing rows must survive intact");
-    }
-
-    /// An index written by a newer build must be refused, not silently stamped
-    /// back down — a downgrade would make the next new binary replay v4 and wipe
-    /// (and, on the Azure backend, re-bill) every chunk.
-    #[test]
-    fn migrate_refuses_a_newer_schema() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
-            .unwrap();
-
-        assert!(migrate(&conn).is_err());
-        let v: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(v, SCHEMA_VERSION + 1, "must not downgrade the stamp");
     }
 
     /// Regression: an intermediate dev build created the chunk tables but left

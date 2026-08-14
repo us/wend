@@ -98,6 +98,58 @@ fn run(args: Cli) -> Result<()> {
             json,
             limit,
         } => run_recall(&situation, json, limit),
+        Command::Recap { id, full, json } => {
+            let store = open_store()?;
+            let sess = resolve_or_report(&store, &id)?;
+            let r = wend_core::recap::session_recap(&store, sess.pk)?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "session_id": sess.session_id,
+                        "compactions": r.compactions,
+                        "opening": r.opening,
+                        "sections": r.recap.sections.iter()
+                            .map(|(h, b)| serde_json::json!({"heading": h, "body": b}))
+                            .collect::<Vec<_>>(),
+                    })
+                );
+                return Ok(());
+            }
+
+            if let Some(open) = &r.opening {
+                println!("opened with:\n  {}\n", one_line(open, 240));
+            }
+            if r.recap.is_empty() {
+                // No summary means no compaction has happened yet. Say that
+                // plainly rather than inferring pending work from raw turns —
+                // action-item extraction is unreliable, and a confident wrong
+                // list of open items is worse than none.
+                println!("no compaction summary yet — nothing more can be said honestly");
+                return Ok(());
+            }
+
+            let wanted: &[&str] = if full {
+                &wend_core::recap::HEADINGS
+            } else {
+                &[
+                    "Primary Request and Intent",
+                    "Pending Tasks",
+                    "Current Work",
+                ]
+            };
+            for h in wanted {
+                if let Some(body) = r.recap.get(h) {
+                    println!("── {h} ──\n{body}\n");
+                }
+            }
+            println!(
+                "(from {} compaction summary(ies) Claude Code already wrote)",
+                r.compactions
+            );
+            Ok(())
+        }
 
         Command::Messages { role, json, limit } => {
             let store = open_store()?;
@@ -653,6 +705,17 @@ fn init_logging(verbose: u8) {
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
+}
+
+/// Collapse to one line and cap by chars, so a long opening ask stays readable
+/// and multi-byte text is never cut mid-character.
+fn one_line(s: &str, n: usize) -> String {
+    let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= n {
+        joined
+    } else {
+        format!("{}…", joined.chars().take(n).collect::<String>())
+    }
 }
 
 #[cfg(test)]
