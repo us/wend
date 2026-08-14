@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.0](https://github.com/us/wend/compare/v0.1.0...v0.2.0) (2026-08-14)
+
+
+### Features
+
+* **cli:** add --role filter and messages command ([96900ec](https://github.com/us/wend/commit/96900ec95b46425061f1a2e99ce79d39bd8e4269))
+* **embed:** add Azure OpenAI backend and situation-based case recall ([4cf53ad](https://github.com/us/wend/commit/4cf53ad546e6b956a8f6b6b9f5b824f63c842442))
+* **plugin:** add profile and skill-forge skills ([ebefe28](https://github.com/us/wend/commit/ebefe28b685674a762ce1e98e31646b8f79dac17))
+* **recap:** surface what a session was for and what it left open ([17d6d24](https://github.com/us/wend/commit/17d6d24c298f4b6b310ed63a1315f083461dd501))
+
+
+### Bug Fixes
+
+* **ci:** accept static-pie as static for musl binary check ([150b34a](https://github.com/us/wend/commit/150b34aec57cb17f789aaa66c244eff28afa5f03))
+
 ## 0.1.0 (2026-06-18)
 
 

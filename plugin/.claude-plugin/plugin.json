@@ -1,7 +1,7 @@
 {
   "name": "wend",
   "description": "Find, recover, and resume your past Claude Code sessions from local history — keyword search, pre-compaction recovery, and worktree topology.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "us"
   },
