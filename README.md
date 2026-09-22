@@ -1,15 +1,18 @@
 # wend
 
-Find, recover, and resume your past **Claude Code** sessions — from the terminal
-or from inside Claude Code itself. Fast, local, single binary, zero network.
+Find, recover, and resume your past **agent** sessions (Claude Code, Codex,
+opencode) — from the terminal or from inside Claude Code itself. Fast, local,
+single binary, zero network.
 
-You run dozens of Claude Code sessions across many directories and can't find the
-one you need. `wend` indexes your whole local history (`~/.claude/projects`) and
-lets you:
+You run dozens of agent sessions across many directories and can't find the
+one you need. `wend` indexes your whole local history (`~/.claude/projects`,
+`~/.codex/sessions`, and opencode's `opencode.db`) and lets you:
 
 - **find** a past session by keyword — `wend search "that firecrawl pricing chat"`
 - **recover** the pre-compaction history the live UI hides — `wend show <id> --recovered` ⭐
-- **resume** an old session — `wend resume <id>` → `cd … && claude --resume …`
+- **resume** an old session — `wend resume <id>` → the right command for that
+  session's source (`claude --resume …`, `codex resume …`, or
+  `opencode run --session …`, each with the `cd …` first)
 - **read / label / map** — `wend show`, `wend name <id> "<alias>"`, `wend tree`
 
 Everything is local and read-only over your transcripts; the only state it writes
@@ -116,16 +119,21 @@ incrementally.
 wend search "rust sqlite fts"           # keyword (BM25, stemmed, session-grouped)
 wend search "fixing a crash" --semantic # meaning-based (hybrid keyword+vector); needs --features semantic build
 wend search "auth bug" --json           # machine-readable (for scripts/skills)
+wend search "auth" --source codex       # only one source: claude | codex | opencode
+wend search "auth" --role user          # only what you typed (or --role assistant)
+wend messages --limit 50 --tail         # your last 50 typed prompts, oldest-first
+wend messages --source opencode --role assistant --limit 5 --json
 wend show <id>                          # read a transcript (numbered messages, total shown)
 wend show <id> --count                  # just how many messages
 wend show <id> --range 10:20            # messages 10–20 (also --head N / --tail N)
 wend show <id> --recovered              # surface pre-compaction history the UI hid
-wend resume <id>                        # prints the cd + claude --resume command
+wend resume <id>                        # prints the cd + resume command for that source
 wend name <id> "payment-spike"          # alias a session so you can find it later
 wend tree [project]                     # worktree/session topology
 ```
 Short session-id prefixes work everywhere (`wend show f8bd399d`); ambiguous
-prefixes list the candidates.
+prefixes list the candidates. Results are tagged by source
+(`[claude|…]`, `[codex|…]`, `[opencode|…]`).
 
 ## Use it from inside Claude Code (plugin)
 

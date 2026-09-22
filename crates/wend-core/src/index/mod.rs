@@ -1,14 +1,17 @@
-//! Indexing: discover top-level session files, assemble them, and write them
-//! into the [`Store`] idempotently.
+//! Indexing: discover session files (Claude Code, Codex) and the opencode
+//! database, assemble them, and write them into the [`Store`] idempotently.
 
 use crate::error::Result;
 use crate::model::{
     BoundaryRecord, BridgeRecord, MessageRecord, Routed, TitleUpdate, WorktreeRecord,
 };
+use crate::parser::codex::{parse_codex_file, CodexFile};
 use crate::parser::parse_file;
 use crate::store::{FileStat, Store};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+
+pub mod opencode;
 
 /// A fully parsed session ready to persist.
 #[derive(Debug)]
@@ -31,6 +34,15 @@ pub struct AssembledSession {
     pub bridges: Vec<BridgeRecord>,
     pub file_mtime_ns: i64,
     pub file_size: i64,
+}
+
+/// Where to find each agent product's history. Missing directories are not an
+/// error — that product is simply not installed.
+#[derive(Debug, Clone)]
+pub struct Sources<'a> {
+    pub claude: &'a Path,
+    pub codex: &'a Path,
+    pub opencode_db: Option<&'a Path>,
 }
 
 /// Outcome of an indexing run.
@@ -109,7 +121,7 @@ pub fn assemble(
 
     AssembledSession {
         session_id,
-        source_kind: "top_level".to_string(),
+        source_kind: "claude".to_string(),
         file_path,
         project_path,
         project_name,
@@ -218,6 +230,219 @@ pub fn index_all(store: &mut Store, projects_dir: &Path, incremental: bool) -> R
         stats.indexed += 1;
     }
     Ok(stats)
+}
+
+/// Index every configured source (Claude Code files, Codex rollout logs, the
+/// opencode database). Stats are additive across sources.
+pub fn index_all_sources(
+    store: &mut Store,
+    sources: &Sources,
+    incremental: bool,
+) -> Result<IndexStats> {
+    let mut total = IndexStats::default();
+    for stats in [
+        index_all(store, sources.claude, incremental)?,
+        index_codex(store, sources.codex, incremental)?,
+        index_opencode(store, sources.opencode_db, incremental)?,
+    ] {
+        total.files_seen += stats.files_seen;
+        total.indexed += stats.indexed;
+        total.skipped_unchanged += stats.skipped_unchanged;
+        total.parse_skipped_lines += stats.parse_skipped_lines;
+    }
+    Ok(total)
+}
+
+/// Discover Codex rollout logs recursively:
+/// `sessions_dir/**/*.jsonl` (year/month/day nesting). Missing dir → empty.
+pub fn discover_codex(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![sessions_dir.to_path_buf()];
+    let mut first = true;
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => {
+                if first {
+                    return Ok(out); // missing dir → nothing to index
+                }
+                continue;
+            }
+        };
+        first = false;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() && p.extension().is_some_and(|e| e == "jsonl") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Assemble a parsed Codex rollout file. The session title is the first thing
+/// the user typed (one line, capped) — Codex stores no title of its own.
+pub fn assemble_codex(
+    parsed: CodexFile,
+    file_path: String,
+    stat: FileStat,
+    fallback_name: Option<String>,
+) -> AssembledSession {
+    let mut messages = Vec::new();
+    let mut first_ts: Option<i64> = None;
+    let mut last_ts: Option<i64> = None;
+    let mut first_user_text: Option<String> = None;
+
+    for (_line, rec) in parsed.records {
+        if let Routed::Message(m) = rec {
+            if let Some(ts) = m.ts {
+                first_ts = Some(first_ts.map_or(ts, |f: i64| f.min(ts)));
+                last_ts = Some(last_ts.map_or(ts, |l: i64| l.max(ts)));
+            }
+            if first_user_text.is_none() && m.rec_type == "user" && !m.fts_text.is_empty() {
+                first_user_text = Some(one_line(&m.fts_text, 100));
+            }
+            messages.push(m);
+        }
+    }
+
+    let session_id = parsed.session_id.unwrap_or_else(|| {
+        Path::new(&file_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let project_path = parsed.cwd;
+    let project_name = project_path
+        .as_ref()
+        .and_then(|p| {
+            Path::new(p)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .or(fallback_name);
+    let title = first_user_text.clone().unwrap_or_default();
+
+    AssembledSession {
+        session_id,
+        source_kind: "codex".to_string(),
+        file_path,
+        project_path,
+        project_name,
+        git_branch: None,
+        first_ts,
+        last_ts,
+        ai_title: first_user_text,
+        custom_title: None,
+        title,
+        has_compaction: parsed.has_compaction,
+        messages,
+        boundaries: Vec::new(),
+        worktrees: Vec::new(),
+        bridges: Vec::new(),
+        file_mtime_ns: stat.mtime_ns,
+        file_size: stat.size,
+    }
+}
+
+/// Index all Codex rollout logs under `sessions_dir` into `store`.
+pub fn index_codex(
+    store: &mut Store,
+    sessions_dir: &Path,
+    incremental: bool,
+) -> Result<IndexStats> {
+    use rayon::prelude::*;
+
+    let paths = discover_codex(sessions_dir)?;
+    let mut stats = IndexStats {
+        files_seen: paths.len(),
+        ..IndexStats::default()
+    };
+
+    let mut worklist: Vec<(PathBuf, String, FileStat)> = Vec::new();
+    for path in paths {
+        let meta = std::fs::metadata(&path)?;
+        let stat = FileStat {
+            mtime_ns: mtime_ns(&meta),
+            size: meta.len() as i64,
+        };
+        let file_path = path.to_string_lossy().into_owned();
+        if incremental {
+            if let Some(prev) = store.file_stat(&file_path)? {
+                if prev == stat {
+                    stats.skipped_unchanged += 1;
+                    continue;
+                }
+            }
+        }
+        worklist.push((path, file_path, stat));
+    }
+
+    let assembled: Vec<Result<(AssembledSession, usize)>> = worklist
+        .into_par_iter()
+        .map(|(path, file_path, stat)| {
+            let parsed = parse_codex_file(&path)?;
+            let skipped = parsed.skipped_count();
+            let fallback_name = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned());
+            Ok((
+                assemble_codex(parsed, file_path, stat, fallback_name),
+                skipped,
+            ))
+        })
+        .collect();
+
+    for result in assembled {
+        let (session, skipped) = result?;
+        stats.parse_skipped_lines += skipped;
+        store.replace_session(&session)?;
+        stats.indexed += 1;
+    }
+    Ok(stats)
+}
+
+/// Index every opencode session from its SQLite database (read-only).
+/// `db_path` is `None` when opencode is not installed → no-op.
+pub fn index_opencode(
+    store: &mut Store,
+    db_path: Option<&Path>,
+    incremental: bool,
+) -> Result<IndexStats> {
+    let mut stats = IndexStats::default();
+    let Some(db_path) = db_path else {
+        return Ok(stats);
+    };
+    let sessions = opencode::read_opencode_sessions(db_path)?;
+    stats.files_seen = sessions.len();
+    for session in &sessions {
+        if incremental {
+            let stat = FileStat {
+                mtime_ns: session.file_mtime_ns,
+                size: session.file_size,
+            };
+            if store.file_stat(&session.file_path)? == Some(stat) {
+                stats.skipped_unchanged += 1;
+                continue;
+            }
+        }
+        store.replace_session(session)?;
+        stats.indexed += 1;
+    }
+    Ok(stats)
+}
+
+fn one_line(s: &str, n: usize) -> String {
+    let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= n {
+        joined
+    } else {
+        joined.chars().take(n).collect()
+    }
 }
 
 fn mtime_ns(meta: &std::fs::Metadata) -> i64 {

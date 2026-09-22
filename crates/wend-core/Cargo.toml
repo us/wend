@@ -1,6 +1,6 @@
 [package]
 name = "wend-core"
-description = "Core engine for wend: parse, index, search, recover, topology over Claude Code transcripts"
+description = "Core engine for wend: parse, index, search, recover, topology over agent transcripts (Claude Code, Codex, opencode)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

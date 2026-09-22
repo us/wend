@@ -1,7 +1,8 @@
 //! `wend-core` — the pure engine behind wend.
 //!
-//! Parses Claude Code `.jsonl` transcripts, indexes them, and serves search,
-//! compaction-recovery, and worktree/subagent topology. This crate is UI-free
+//! Parses agent `.jsonl` transcripts (Claude Code, Codex) and the opencode
+//! SQLite database, indexes them, and serves search, compaction-recovery, and
+//! worktree/subagent topology. This crate is UI-free
 //! and never writes to stdout — that is the CLI's job.
 
 pub mod config;
@@ -9,6 +10,7 @@ pub mod config;
 pub mod embed;
 pub mod error;
 pub mod index;
+pub mod live;
 pub mod model;
 pub mod parser;
 pub mod recap;

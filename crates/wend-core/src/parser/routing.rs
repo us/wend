@@ -186,7 +186,7 @@ fn str_opt(v: &Value, key: &str) -> Option<String> {
 }
 
 /// Parse the top-level `timestamp` (RFC3339) into epoch milliseconds (UTC).
-fn ts_ms(obj: &Value) -> Option<i64> {
+pub(crate) fn ts_ms(obj: &Value) -> Option<i64> {
     let s = obj.get("timestamp").and_then(Value::as_str)?;
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()

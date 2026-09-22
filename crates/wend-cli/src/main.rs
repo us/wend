@@ -2,6 +2,7 @@
 
 mod cli;
 mod render;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -35,14 +36,26 @@ fn run(args: Cli) -> Result<()> {
             }
             let db = config::index_db_path()?;
             let projects = config::projects_dir()?;
+            let codex = config::codex_sessions_dir()?;
+            let opencode_db = config::opencode_db_path()?;
             let mut store =
                 Store::open(&db).with_context(|| format!("opening index at {}", db.display()))?;
-            let stats = index::index_all(&mut store, &projects, incremental)
+            let sources = index::Sources {
+                claude: &projects,
+                codex: &codex,
+                opencode_db: opencode_db.as_deref(),
+            };
+            let stats = index::index_all_sources(&mut store, &sources, incremental)
                 .with_context(|| format!("indexing {}", projects.display()))?;
             println!(
                 "indexed {} session(s) — {} unchanged, {} files seen, {} bad lines skipped",
                 stats.indexed, stats.skipped_unchanged, stats.files_seen, stats.parse_skipped_lines
             );
+            if opencode_db.is_none() {
+                tracing::info!(
+                    "opencode not found — skipping (no ~/.local/share/opencode/opencode.db)"
+                );
+            }
             if embed {
                 run_embed(&mut store)?;
             }
@@ -55,12 +68,54 @@ fn run(args: Cli) -> Result<()> {
             semantic,
             json,
             role,
+            source,
+            live,
             limit,
         } => {
+            let role = role.map(|r| r.as_db_str());
+            let source = source.map(|s| s.as_db_str());
+            if live {
+                if semantic {
+                    anyhow::bail!(
+                        "--live and --semantic cannot be combined (live search is keyword-only)"
+                    );
+                }
+                let projects = config::projects_dir()?;
+                let codex = config::codex_sessions_dir()?;
+                let opencode_db = config::opencode_db_path()?;
+                let sources = index::Sources {
+                    claude: &projects,
+                    codex: &codex,
+                    opencode_db: opencode_db.as_deref(),
+                };
+                let hits = wend_core::live::search_live(&sources, &query, limit, role, source)?;
+                if json {
+                    println!("{}", serde_json::to_string(&hits)?);
+                } else if hits.is_empty() {
+                    println!("no matches for {query:?} (live scan)");
+                } else {
+                    for (i, h) in hits.iter().enumerate() {
+                        let title = if h.title.is_empty() {
+                            "(untitled)"
+                        } else {
+                            &h.title
+                        };
+                        println!(
+                            "{}. [{}|{}] {} · {}",
+                            i + 1,
+                            h.source,
+                            h.project,
+                            title,
+                            h.session_id
+                        );
+                        println!("    {}", h.snippet);
+                    }
+                }
+                return Ok(());
+            }
             let db = config::index_db_path()?;
             let store =
                 Store::open(&db).with_context(|| format!("opening index at {}", db.display()))?;
-            let role = role.map(|r| r.as_db_str());
             let hits = if semantic {
                 if role.is_some() {
                     tracing::warn!(
@@ -69,7 +124,7 @@ fn run(args: Cli) -> Result<()> {
                 }
                 run_semantic(&store, &query, limit)?
             } else {
-                search::search(&store, &query, limit, role)?
+                search::search(&store, &query, limit, role, source)?
             };
             if json {
                 println!("{}", serde_json::to_string(&hits)?);
@@ -86,7 +141,14 @@ fn run(args: Cli) -> Result<()> {
                     } else {
                         &h.title
                     };
-                    println!("{}. [{}] {} · {}", i + 1, h.project, title, h.session_id);
+                    println!(
+                        "{}. [{}|{}] {} · {}",
+                        i + 1,
+                        h.source,
+                        h.project,
+                        title,
+                        h.session_id
+                    );
                     println!("    {}", h.snippet);
                 }
             }
@@ -151,9 +213,23 @@ fn run(args: Cli) -> Result<()> {
             Ok(())
         }
 
-        Command::Messages { role, json, limit } => {
+        Command::Messages {
+            role,
+            source,
+            json,
+            limit,
+            tail,
+        } => {
+            if tail && limit.is_none() {
+                anyhow::bail!("--tail needs --limit (it shows the last N messages)");
+            }
             let store = open_store()?;
-            let msgs = store.list_prose_messages(role.as_db_str(), limit)?;
+            let msgs = store.list_prose_messages(
+                role.as_db_str(),
+                limit,
+                source.map(|s| s.as_db_str()),
+                tail,
+            )?;
             if json {
                 println!("{}", serde_json::to_string(&msgs)?);
             } else {
@@ -166,7 +242,10 @@ fn run(args: Cli) -> Result<()> {
                         } else {
                             &m.title
                         };
-                        println!("\n── {} · {} · {} ──", title, m.project, m.session_id);
+                        println!(
+                            "\n── [{}] {} · {} · {} ──",
+                            m.source, title, m.project, m.session_id
+                        );
                         cur = m.session_id.clone();
                     }
                     println!("{}", m.text);
@@ -181,12 +260,28 @@ fn run(args: Cli) -> Result<()> {
         Command::Doctor => {
             let db = config::index_db_path()?;
             let projects = config::projects_dir()?;
+            let codex = config::codex_sessions_dir()?;
+            let opencode_db = config::opencode_db_path()?;
             println!("wend {}", wend_core::VERSION);
-            println!("projects dir: {}", projects.display());
+            println!("claude dir:   {}", projects.display());
+            println!("codex dir:    {}", codex.display());
+            println!(
+                "opencode db:  {}",
+                opencode_db
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(not found — skipping)".to_string())
+            );
             println!("index db:     {}", db.display());
             if db.exists() {
                 let store = Store::open(&db)?;
-                println!("sessions:     {}", store.session_count()?);
+                let by_source = store.session_counts_by_source()?;
+                let counts = by_source
+                    .iter()
+                    .map(|(s, n)| format!("{s}: {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("sessions:     {} ({})", store.session_count()?, counts);
                 println!("messages:     {}", store.message_count()?);
                 println!("semantic:     {}", semantic_status(&store));
             } else {
@@ -302,6 +397,7 @@ fn run(args: Cli) -> Result<()> {
                 &sess.title
             };
             println!("# {title}  [{}]", sess.session_id);
+            println!("  source: {}", sess.source);
             if let Some(p) = &sess.project_path {
                 println!("  project: {p}");
             }
@@ -321,6 +417,13 @@ fn run(args: Cli) -> Result<()> {
         Command::Resume { id } => {
             let store = open_store()?;
             let sess = resolve_or_report(&store, &id)?;
+            // Each agent resumes with its own CLI. The `cd` matters because the
+            // session is rooted in its original working directory.
+            let resume_cmd = match sess.source.as_str() {
+                "codex" => format!("codex resume {}", sess.session_id),
+                "opencode" => format!("opencode run --session {}", sess.session_id),
+                _ => format!("claude --resume {}", sess.session_id),
+            };
             match &sess.project_path {
                 Some(cwd) => {
                     if !std::path::Path::new(cwd).is_dir() {
@@ -328,13 +431,9 @@ fn run(args: Cli) -> Result<()> {
                             "warning: project dir no longer exists: {cwd} (the cd will fail — resume manually from another dir if needed)"
                         );
                     }
-                    println!(
-                        "cd {} && claude --resume {}",
-                        shell_quote(cwd),
-                        sess.session_id
-                    );
+                    println!("cd {} && {resume_cmd}", shell_quote(cwd));
                 }
-                None => println!("claude --resume {}", sess.session_id),
+                None => println!("{resume_cmd}"),
             }
             Ok(())
         }
@@ -371,10 +470,11 @@ fn run(args: Cli) -> Result<()> {
                 println!("\n{}  ({n} session(s))", proj.repo);
                 for s in &proj.main_sessions {
                     println!(
-                        "  ├─ {}  {}  · {} msgs",
+                        "  ├─ {}  {}  · {} msgs{}",
                         short(&s.session_id),
                         title_or(&s.title),
-                        s.message_count
+                        s.message_count,
+                        source_tag(&s.source),
                     );
                 }
                 for w in &proj.worktrees {
@@ -386,10 +486,11 @@ fn run(args: Cli) -> Result<()> {
                     println!("  ├─ ⌥ worktree: {} (branch {branch}) [{conf}]", w.name);
                     for s in &w.sessions {
                         println!(
-                            "  │    └─ {}  {}  · {} msgs",
+                            "  │    └─ {}  {}  · {} msgs{}",
                             short(&s.session_id),
                             title_or(&s.title),
-                            s.message_count
+                            s.message_count,
+                            source_tag(&s.source),
                         );
                     }
                 }
@@ -400,6 +501,14 @@ fn run(args: Cli) -> Result<()> {
             anyhow::bail!(
                 "`export` is not implemented yet — use `wend show <id>` to read a transcript for now"
             )
+        }
+        Command::Update { check } => {
+            let mut args = vec!["update".to_string()];
+            if check {
+                args.push("--check".to_string());
+            }
+            update::run(&args)?;
+            Ok(())
         }
     }
 }
@@ -535,9 +644,7 @@ fn run_embed(store: &mut Store) -> Result<()> {
     // Chunk first: on a fresh index nothing is chunked yet, so counting pending
     // work before this would report zero and quote a $0.00 estimate.
     let created = embed::build_chunks(store)? + embed::cases::build_cases(store)?;
-    let pending = store
-        .chunks_needing_vectors(&embed::current_model_id()?, None)?
-        .len();
+    let pending = store.chunks_needing_vectors_count(&embed::current_model_id()?, None)? as usize;
 
     // Only the local backend is CPU-bound and thread-tunable; saying so on the
     // Azure path would be nonsense.
@@ -581,7 +688,7 @@ fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHi
 #[cfg(not(any(feature = "semantic", feature = "azure")))]
 fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
     tracing::warn!("--semantic needs a build with --features semantic (or azure); keyword only");
-    Ok(search::search(store, query, limit, None)?)
+    Ok(search::search(store, query, limit, None, None)?)
 }
 
 /// Resolve a short session-id prefix to exactly one session, or report candidates.
@@ -603,8 +710,9 @@ fn resolve_or_report(store: &Store, id: &str) -> Result<SessionRef> {
                     &c.title
                 };
                 eprintln!(
-                    "  {}  [{}]  {title}",
+                    "  {}  [{}|{}]  {title}",
                     short(&c.session_id),
+                    c.source,
                     c.project_path.as_deref().unwrap_or("?")
                 );
             }
@@ -615,6 +723,16 @@ fn resolve_or_report(store: &Store, id: &str) -> Result<SessionRef> {
 
 fn short(session_id: &str) -> &str {
     &session_id[..session_id.len().min(8)]
+}
+
+/// Empty for Claude Code (the historical default); ` · <source>` otherwise, so
+/// mixed-source trees stay readable without changing claude-only output.
+fn source_tag(source: &str) -> String {
+    if source == "claude" {
+        String::new()
+    } else {
+        format!(" · {source}")
+    }
 }
 
 fn title_or(t: &str) -> &str {
