@@ -26,11 +26,14 @@ pub fn compile_query(input: &str) -> Option<String> {
 /// (the best-matching message). Returns empty for an empty query.
 /// `role`, when set (`"user"` / `"assistant"`), restricts matches to messages of
 /// that role. Titles have no role, so the title tier is skipped when it's set.
+/// `source`, when set (`"claude"` / `"codex"` / `"opencode"`), restricts matches
+/// to one agent product.
 pub fn search(
     store: &Store,
     query: &str,
     limit: usize,
     role: Option<&str>,
+    source: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = compile_query(query) else {
         return Ok(Vec::new());
@@ -43,7 +46,7 @@ pub fn search(
     let mut grouped = Vec::with_capacity(limit);
 
     if role.is_none() {
-        for hit in store.search_titles_raw(&match_query, limit)? {
+        for hit in store.search_titles_raw(&match_query, limit, source)? {
             if seen.insert(hit.session_id.clone()) {
                 grouped.push(hit);
                 if grouped.len() >= limit {
@@ -58,7 +61,7 @@ pub fn search(
     // let min>max (a `clamp(limit, CAP)` panics when limit>CAP).
     const RAW_CAP: usize = 50_000;
     let raw_limit = limit.saturating_mul(20).max(limit).min(RAW_CAP);
-    for hit in store.search_raw(&match_query, raw_limit, role)? {
+    for hit in store.search_raw(&match_query, raw_limit, role, source)? {
         if seen.insert(hit.session_id.clone()) {
             grouped.push(hit);
             if grouped.len() >= limit {

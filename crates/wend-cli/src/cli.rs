@@ -22,7 +22,30 @@ impl RoleFilter {
     }
 }
 
-/// wend: find, recover, and visualize your Claude Code session history.
+/// Restrict a search/dump to one agent product.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SourceFilter {
+    /// Claude Code sessions.
+    Claude,
+    /// Codex rollout logs.
+    Codex,
+    /// Opencode sessions.
+    Opencode,
+}
+
+impl SourceFilter {
+    /// The `source_kind` value as stored in the index.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            SourceFilter::Claude => "claude",
+            SourceFilter::Codex => "codex",
+            SourceFilter::Opencode => "opencode",
+        }
+    }
+}
+
+/// wend: find, recover, and visualize your agent session history
+/// (Claude Code, Codex, opencode).
 #[derive(Debug, Parser)]
 #[command(name = "wend", version, about)]
 pub struct Cli {
@@ -36,7 +59,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Build or update the local index from ~/.claude/projects.
+    /// Build or update the local index from Claude Code, Codex, and opencode history.
     Index {
         /// Re-index only files whose mtime/size changed.
         #[arg(long)]
@@ -61,6 +84,13 @@ pub enum Command {
         /// Only match messages from one side: `user` or `assistant`.
         #[arg(long, value_enum)]
         role: Option<RoleFilter>,
+        /// Only match sessions from one source: `claude`, `codex`, or `opencode`.
+        #[arg(long, value_enum)]
+        source: Option<SourceFilter>,
+        /// Skip the index and grep the raw transcripts instead. Slower on a
+        /// huge corpus, but needs no `wend index` first; newest session first.
+        #[arg(long)]
+        live: bool,
         /// Max results.
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -103,12 +133,18 @@ pub enum Command {
         /// Which side to dump (default: user — what you typed).
         #[arg(long, value_enum, default_value = "user")]
         role: RoleFilter,
+        /// Only dump sessions from one source: `claude`, `codex`, or `opencode`.
+        #[arg(long, value_enum)]
+        source: Option<SourceFilter>,
         /// Emit machine-readable JSON (for the skill).
         #[arg(long)]
         json: bool,
         /// Cap the number of messages (default: no cap — dump everything).
         #[arg(long)]
         limit: Option<usize>,
+        /// Dump the most recent messages instead of the oldest (needs --limit).
+        #[arg(long)]
+        tail: bool,
     },
     /// Show a session transcript by id.
     Show {
@@ -154,6 +190,12 @@ pub enum Command {
         id: String,
         /// Alias text.
         alias: String,
+    },
+    /// Fetch the newest release and install it over this binary.
+    Update {
+        /// Only report what the newest release is, changing nothing.
+        #[arg(long)]
+        check: bool,
     },
     /// Report index health, paths, and capabilities.
     Doctor,

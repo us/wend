@@ -1,13 +1,14 @@
 ---
 name: find
-description: "Find, recover, or resume a past Claude Code session from local history. Use when the user asks where a past chat was, can't find a previous conversation, wants history hidden by compaction, or wants to continue an old session. Triggers: 'find that chat about X', 'which session did I…', 'where did we discuss…', 'recover compacted/pre-summary history', 'resume that session', 'nerede konuşmuştuk', 'hangi sessionda'. Runs the local read-only `wend` CLI."
+description: "Find, recover, or resume a past agent session (Claude Code, Codex, opencode) from local history. Use when the user asks where a past chat was, can't find a previous conversation, wants history hidden by compaction, or wants to continue an old session. Triggers: 'find that chat about X', 'which session did I…', 'where did we discuss…', 'recover compacted/pre-summary history', 'resume that session', 'nerede konuşmuştuk', 'hangi sessionda'. Runs the local read-only `wend` CLI."
 allowed-tools: ["Bash(wend *)"]
 ---
 
 # Session Finder
 
-Help the user find, read, recover, resume, or label their past Claude Code
-sessions using the local `wend` CLI (read-only over `~/.claude/projects`).
+Help the user find, read, recover, resume, or label their past agent sessions
+(Claude Code, Codex, opencode) using the local `wend` CLI (read-only over
+their history).
 
 ## Flow
 1. Turn the request into a query and run:
@@ -15,11 +16,14 @@ sessions using the local `wend` CLI (read-only over `~/.claude/projects`).
    — add `--role user` or `--role assistant` to match only one side of the
    conversation (what the user typed vs. what the model said). Tool output isn't
    a role — it lives inside user/assistant messages and can't be filtered out.
+   Add `--source claude|codex|opencode` when they mean one specific tool.
 2. Present results as a numbered list (title · project · snippet). Use each
    result's `session_id` for follow-ups. If nothing fits, refine the query.
 3. Read one: `wend show <session_id> --head 40`
    — add `--recovered` to surface pre-compaction history the live UI hides.
-4. Continue one: `wend resume <session_id>` prints `cd … && claude --resume …`.
+4. Continue one: `wend resume <session_id>` prints the right resume command for
+   that session's source (`claude --resume …`, `codex resume …`, or
+   `opencode run --session …`, each with the `cd …` first).
    Give that command to the user to run themselves — a running session cannot
    resume another.
 5. Label one for later: `wend name <session_id> "<alias>"`.

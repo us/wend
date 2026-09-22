@@ -1,6 +1,7 @@
 //! Transcript parsing: read a `.jsonl` file into ordered [`Routed`] records,
 //! tolerating corrupt/truncated lines.
 
+pub mod codex;
 pub(crate) mod content;
 pub(crate) mod routing;
 

@@ -40,3 +40,32 @@ pub fn projects_dir() -> Result<PathBuf> {
         .map_err(|e| Error::InvalidData(format!("cannot find home dir: {e}")))?;
     Ok(home.join(".claude").join("projects"))
 }
+
+/// Directory holding Codex rollout logs (`~/.codex/sessions`, recursive).
+/// Override with `WEND_CODEX_SESSIONS`.
+pub fn codex_sessions_dir() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("WEND_CODEX_SESSIONS") {
+        return Ok(PathBuf::from(p));
+    }
+    let home = etcetera::home_dir()
+        .map_err(|e| Error::InvalidData(format!("cannot find home dir: {e}")))?;
+    Ok(home.join(".codex").join("sessions"))
+}
+
+/// Opencode's SQLite database (`~/.local/share/opencode/opencode.db`).
+/// Override with `WEND_OPENCODE_DB`. `None` when the file does not exist —
+/// opencode simply is not installed, which is not an error.
+pub fn opencode_db_path() -> Result<Option<PathBuf>> {
+    if let Ok(p) = std::env::var("WEND_OPENCODE_DB") {
+        let p = PathBuf::from(p);
+        return Ok(p.is_file().then_some(p));
+    }
+    let home = etcetera::home_dir()
+        .map_err(|e| Error::InvalidData(format!("cannot find home dir: {e}")))?;
+    let p = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    Ok(p.is_file().then_some(p))
+}

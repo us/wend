@@ -3,7 +3,7 @@
 //! Hermetic — uses a tempdir, never `~/.claude`.
 
 use std::path::PathBuf;
-use wend_core::index::index_all;
+use wend_core::index::{index_all, index_all_sources, Sources};
 use wend_core::search::search;
 use wend_core::store::Store;
 
@@ -43,12 +43,12 @@ fn indexes_fixture_and_search_finds_it() {
     );
 
     // keyword search hits the indexed content
-    let hits = search(&store, "gradient", 10, None).unwrap();
+    let hits = search(&store, "gradient", 10, None, None).unwrap();
     assert!(!hits.is_empty(), "expected a match for 'gradient'");
     assert!(hits.iter().any(|h| h.session_id == "basic_session"));
 
     // thinking text must not be searchable
-    let secret = search(&store, "private reasoning", 10, None).unwrap();
+    let secret = search(&store, "private reasoning", 10, None, None).unwrap();
     assert!(secret.is_empty(), "thinking blocks must not be indexed");
 }
 
@@ -62,16 +62,16 @@ fn role_filter_restricts_matches_to_one_side() {
     // assistant's. Each term must be found under its own role and hidden under
     // the other. (Note: a tool_result rides in a user-role message, so the tool
     // output "clip_grad_norm_" is user-side here — tool content isn't a role.)
-    assert!(!search(&store, "explosion", 10, Some("user"))
+    assert!(!search(&store, "explosion", 10, Some("user"), None)
         .unwrap()
         .is_empty());
-    assert!(search(&store, "explosion", 10, Some("assistant"))
+    assert!(search(&store, "explosion", 10, Some("assistant"), None)
         .unwrap()
         .is_empty());
-    assert!(!search(&store, "Picking", 10, Some("assistant"))
+    assert!(!search(&store, "Picking", 10, Some("assistant"), None)
         .unwrap()
         .is_empty());
-    assert!(search(&store, "Picking", 10, Some("user"))
+    assert!(search(&store, "Picking", 10, Some("user"), None)
         .unwrap()
         .is_empty());
 }
@@ -82,7 +82,9 @@ fn list_prose_messages_dumps_typed_prompts_only() {
     let mut store = Store::open_in_memory().unwrap();
     index_all(&mut store, &projects, false).unwrap();
 
-    let msgs = store.list_prose_messages("user", None).unwrap();
+    let msgs = store
+        .list_prose_messages("user", None, None, false)
+        .unwrap();
     let texts: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
 
     // The user's real typed prompt is dumped...
@@ -96,7 +98,13 @@ fn list_prose_messages_dumps_typed_prompts_only() {
     assert!(!texts.iter().any(|t| t.contains("Picking")));
 
     // limit caps the total.
-    assert!(store.list_prose_messages("user", Some(1)).unwrap().len() <= 1);
+    assert!(
+        store
+            .list_prose_messages("user", Some(1), None, false)
+            .unwrap()
+            .len()
+            <= 1
+    );
 }
 
 #[test]
@@ -115,7 +123,7 @@ fn reindex_is_idempotent_no_duplicates() {
     assert_eq!(store.message_count().unwrap(), messages_after_first);
 
     // Search still returns exactly one session (no duplicate rows).
-    let hits = search(&store, "gradient", 50, None).unwrap();
+    let hits = search(&store, "gradient", 50, None, None).unwrap();
     let distinct_sessions: std::collections::HashSet<_> =
         hits.iter().map(|h| h.session_id.clone()).collect();
     assert_eq!(distinct_sessions.len(), 1);
@@ -180,13 +188,13 @@ fn name_makes_session_findable_by_alias() {
     // A token that appears nowhere in the fixture's message content.
     let alias = "qqzz-unique-alias-token";
     assert!(
-        search(&store, alias, 5, None).unwrap().is_empty(),
+        search(&store, alias, 5, None, None).unwrap().is_empty(),
         "precondition: alias token must not exist in message bodies"
     );
 
     store.set_custom_title(sess.pk, alias).unwrap();
 
-    let hits = search(&store, alias, 5, None).unwrap();
+    let hits = search(&store, alias, 5, None, None).unwrap();
     assert!(
         hits.iter().any(|h| h.session_id == "basic_session"),
         "after naming, the session must be findable by its alias (title search)"
@@ -207,7 +215,9 @@ fn reindex_after_mutation_leaves_no_orphans() {
 
     let mut store = Store::open_in_memory().unwrap();
     index_all(&mut store, &projects, false).unwrap();
-    assert!(!search(&store, "gradient", 10, None).unwrap().is_empty());
+    assert!(!search(&store, "gradient", 10, None, None)
+        .unwrap()
+        .is_empty());
 
     // Mutate: replace the file with a tiny 2-message session.
     std::fs::write(
@@ -221,8 +231,10 @@ fn reindex_after_mutation_leaves_no_orphans() {
     assert_eq!(store.session_count().unwrap(), 1);
     assert_eq!(store.message_count().unwrap(), 2, "old messages gone");
     // Old content no longer searchable → no orphan FTS rows.
-    assert!(search(&store, "gradient", 10, None).unwrap().is_empty());
-    assert!(!search(&store, "different topic", 10, None)
+    assert!(search(&store, "gradient", 10, None, None)
+        .unwrap()
+        .is_empty());
+    assert!(!search(&store, "different topic", 10, None, None)
         .unwrap()
         .is_empty());
     assert_eq!(store.foreign_key_violations().unwrap(), 0);
@@ -265,7 +277,7 @@ fn huge_limit_does_not_panic() {
     let (_guard, projects) = temp_projects();
     let mut store = Store::open_in_memory().unwrap();
     index_all(&mut store, &projects, false).unwrap();
-    let hits = search(&store, "gradient", 10_000_000, None).unwrap();
+    let hits = search(&store, "gradient", 10_000_000, None, None).unwrap();
     assert!(hits.len() <= 1, "only one session in the fixture");
 }
 
@@ -285,13 +297,13 @@ fn alias_survives_full_reindex() {
     store
         .set_custom_title(sess.pk, "keepme-alias-token")
         .unwrap();
-    assert!(!search(&store, "keepme-alias-token", 5, None)
+    assert!(!search(&store, "keepme-alias-token", 5, None, None)
         .unwrap()
         .is_empty());
 
     // FULL reindex (not incremental) must NOT wipe the alias.
     index_all(&mut store, &projects, false).unwrap();
-    let hits = search(&store, "keepme-alias-token", 5, None).unwrap();
+    let hits = search(&store, "keepme-alias-token", 5, None, None).unwrap();
     assert!(
         hits.iter().any(|h| h.session_id == "basic_session"),
         "alias must survive a full re-index"
@@ -310,4 +322,120 @@ fn incremental_skips_unchanged_files() {
     let second = index_all(&mut store, &projects, true).unwrap();
     assert_eq!(second.indexed, 0, "unchanged file must be skipped");
     assert_eq!(second.skipped_unchanged, 1);
+}
+
+/// A Codex rollout log indexes as source `codex`: user/assistant turns are
+/// searchable, the title derives from the first prompt, and resume points at
+/// the codex CLI (covered in the CLI, here: source is stored).
+#[test]
+fn codex_rollout_indexes_as_codex_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let codex = dir.path().join("codex");
+    std::fs::create_dir_all(codex.join("2026/09/04")).unwrap();
+    std::fs::write(
+        codex.join("2026/09/04/rollout-test.jsonl"),
+        "{\"timestamp\":\"2026-09-04T13:24:40.608Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"session_id\":\"codex-sess-1\",\"cwd\":\"/Users/dev/proj\"}}\n\
+         {\"timestamp\":\"2026-09-04T13:24:43.923Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"id\":\"u1\",\"content\":[{\"type\":\"text\",\"text\":\"deferasiroxaban dosage question\"}]}}}\n\
+         {\"timestamp\":\"2026-09-04T13:24:44.086Z\",\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"id\":\"a1\",\"content\":[{\"type\":\"Text\",\"text\":\"here is the answer\"}]}}}\n",
+    )
+    .unwrap();
+
+    let mut store = Store::open_in_memory().unwrap();
+    let sources = Sources {
+        claude: &projects,
+        codex: &codex,
+        opencode_db: None,
+    };
+    let stats = index_all_sources(&mut store, &sources, false).unwrap();
+    assert_eq!(stats.indexed, 1);
+
+    let sess = store
+        .find_sessions("codex-sess-1", 5)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("codex session indexed");
+    assert_eq!(sess.source, "codex");
+    assert_eq!(sess.project_path.as_deref(), Some("/Users/dev/proj"));
+
+    let hits = search(&store, "deferasiroxaban", 10, None, None).unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.session_id == "codex-sess-1" && h.source == "codex"),
+        "codex content must be searchable with its source attached"
+    );
+
+    // Incremental re-index skips the unchanged rollout log.
+    let second = index_all_sources(&mut store, &sources, true).unwrap();
+    assert_eq!(second.indexed, 0);
+    assert_eq!(second.skipped_unchanged, 1);
+}
+
+/// `--source` narrows keyword search to one agent product.
+#[test]
+fn source_filter_narrows_search_to_one_product() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    let proj = projects.join("-Users-dev-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::copy(
+        fixture("basic_session.jsonl"),
+        proj.join("basic_session.jsonl"),
+    )
+    .unwrap();
+    let codex = dir.path().join("codex");
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(
+        codex.join("rollout-x.jsonl"),
+        "{\"timestamp\":\"2026-09-04T13:24:40.608Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"session_id\":\"codex-x\",\"cwd\":\"/Users/dev/proj\"}}\n\
+         {\"timestamp\":\"2026-09-04T13:24:43.923Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"id\":\"u1\",\"content\":[{\"type\":\"text\",\"text\":\"gradient zebra stripes\"}]}}}\n",
+    )
+    .unwrap();
+
+    let mut store = Store::open_in_memory().unwrap();
+    let sources = Sources {
+        claude: &projects,
+        codex: &codex,
+        opencode_db: None,
+    };
+    index_all_sources(&mut store, &sources, false).unwrap();
+
+    // Unfiltered finds both sessions (claude fixture + codex share "gradient").
+    let all = search(&store, "gradient", 10, None, None).unwrap();
+    assert_eq!(all.len(), 2);
+
+    let claude_only = search(&store, "gradient", 10, None, Some("claude")).unwrap();
+    assert_eq!(claude_only.len(), 1);
+    assert!(claude_only.iter().all(|h| h.source == "claude"));
+
+    let codex_only = search(&store, "gradient", 10, None, Some("codex")).unwrap();
+    assert_eq!(codex_only.len(), 1);
+    assert!(codex_only.iter().all(|h| h.source == "codex"));
+
+    // Title tier honors the filter too (codex title derives from its prompt).
+    let titled = search(&store, "zebra", 10, None, Some("claude")).unwrap();
+    assert!(titled.is_empty(), "zebra lives only in the codex session");
+
+    // ...and the prose dump as well.
+    let dump = store
+        .list_prose_messages("user", None, Some("codex"), false)
+        .unwrap();
+    assert!(!dump.is_empty());
+    assert!(dump.iter().all(|m| m.source == "codex"));
+
+    // --tail returns the newest messages in flow order.
+    let head = store
+        .list_prose_messages("user", Some(1), None, false)
+        .unwrap();
+    let tail = store
+        .list_prose_messages("user", Some(1), None, true)
+        .unwrap();
+    assert_eq!(head.len(), 1);
+    assert_eq!(tail.len(), 1);
+    assert_ne!(
+        head[0].text, tail[0].text,
+        "head and tail of a 2-message dump must differ"
+    );
 }

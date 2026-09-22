@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version (stored in `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// v2: session-level embedding vectors (superseded by chunk-level in v3).
 const SCHEMA_V2: &str = r#"
@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS chunk_vectors(
 const SCHEMA_V4: &str = r#"
 DELETE FROM chunk_vectors;
 DELETE FROM chunks;
+"#;
+
+/// v6: multi-source sessions. `source_kind` was always `"top_level"`
+/// (Claude Code only); it now names the agent product (`claude` / `codex` /
+/// `opencode`). Existing rows are relabeled, no content touched.
+const SCHEMA_V6: &str = r#"
+UPDATE sessions SET source_kind='claude' WHERE source_kind='top_level';
+UPDATE session_files SET source_kind='claude' WHERE source_kind='top_level';
 "#;
 
 /// v5: the case library shares the `chunks` table rather than getting its own.
@@ -215,6 +223,9 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if version < 5 {
         conn.execute_batch(SCHEMA_V5)?;
     }
+    if version < 6 {
+        conn.execute_batch(SCHEMA_V6)?;
+    }
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -320,8 +331,7 @@ mod tests {
         assert_eq!(text, "existing prose", "existing rows must survive intact");
     }
 
-    /// Regression: an intermediate dev build created the chunk tables but left
-    /// `user_version` at 2. The v3 migration must tolerate the pre-existing
+    /// Regression: an intermediate dev build created the chunk tables but left    /// `user_version` at 2. The v3 migration must tolerate the pre-existing
     /// tables instead of failing with "table chunks already exists".
     #[test]
     fn migrate_tolerates_v3_tables_present_at_version_2() {
@@ -343,5 +353,39 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// v6 relabels pre-multi-source rows (`top_level`) as `claude` without
+    /// touching anything else.
+    #[test]
+    fn v6_relabels_top_level_as_claude() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 5_i64).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions(id, session_id, source_kind, file_path, title) VALUES (1,'s1','top_level','/p/s1.jsonl','t');
+             INSERT INTO session_files(path, source_kind, mtime_ns, size) VALUES ('/p/s1.jsonl','top_level',7,8);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (sk, fk): (String, String) = conn
+            .query_row(
+                "SELECT source_kind, file_path FROM sessions WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sk, "claude");
+        assert_eq!(fk, "/p/s1.jsonl");
+        let fsk: String = conn
+            .query_row(
+                "SELECT source_kind FROM session_files WHERE path='/p/s1.jsonl'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fsk, "claude");
     }
 }

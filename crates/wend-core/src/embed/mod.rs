@@ -28,8 +28,23 @@ use crate::store::{ChunkVec, SearchHit, Store};
 /// Target chunk size in bytes.
 const CHUNK_BYTES: usize = 1200;
 
-/// How many chunks go into one embedding request.
-const BATCH: usize = 96;
+/// How many chunks go into one embedding request. Small on purpose: a batch
+/// holds 96+ full-length token sequences plus the model's working buffers per
+/// thread, and ONNX arenas only grow — a big batch is the fastest way to blow
+/// past a memory budget. Override with `WEND_EMBED_BATCH`.
+fn embed_batch() -> usize {
+    if let Ok(v) = std::env::var("WEND_EMBED_BATCH") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    16
+}
+
+/// How many pending chunk rows to hold at once while backfilling. The pipeline
+/// pages through the backlog (`after_id`) so a 78k-chunk queue never sits in
+/// RAM next to the ONNX arenas.
+const PAGE: usize = 512;
 
 #[cfg(feature = "semantic")]
 fn err<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> Error + '_ {
@@ -298,33 +313,40 @@ pub fn build_chunks(store: &mut Store) -> Result<usize> {
 }
 
 /// Embed every chunk lacking a vector for the current model. Resume-safe.
+/// Pages through the backlog so memory stays flat no matter how many chunks
+/// are pending; each page is embedded in small batches and written before the
+/// next page is even loaded.
 pub fn embed_pending(store: &mut Store) -> Result<usize> {
     let model = current_model_id()?;
-    // `None`: every kind. Prose chunks and cases share the pipeline, and
-    // filtering to one here would leave the other permanently unembedded.
-    let pending = store.chunks_needing_vectors(&model, None)?;
-    if pending.is_empty() {
-        return Ok(0);
-    }
-
+    let batch = embed_batch();
     let mut embedder = Embedder::load()?;
     let mut embedded = 0;
-    for batch in pending.chunks(BATCH) {
-        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-        let vectors = embedder.embed_passages(&texts)?;
-        if vectors.len() != batch.len() {
-            return Err(Error::InvalidData(format!(
-                "backend returned {} vectors for {} inputs",
-                vectors.len(),
-                batch.len()
-            )));
+    let mut after_id = 0;
+    loop {
+        // `None`: every kind. Prose chunks and cases share the pipeline, and
+        // filtering to one here would leave the other permanently unembedded.
+        let page = store.chunks_needing_vectors_after(&model, None, after_id, PAGE)?;
+        if page.is_empty() {
+            break;
         }
-        let rows: Vec<(i64, Vec<f32>)> = batch
-            .iter()
-            .map(|(cid, _)| *cid)
-            .zip(vectors)
-            .collect::<Vec<_>>();
-        embedded += store.store_chunk_vectors_batch(&model, &rows)?;
+        for chunk in page.chunks(batch) {
+            let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
+            let vectors = embedder.embed_passages(&texts)?;
+            if vectors.len() != chunk.len() {
+                return Err(Error::InvalidData(format!(
+                    "backend returned {} vectors for {} inputs",
+                    vectors.len(),
+                    chunk.len()
+                )));
+            }
+            let rows: Vec<(i64, Vec<f32>)> = chunk
+                .iter()
+                .map(|(cid, _)| *cid)
+                .zip(vectors)
+                .collect::<Vec<_>>();
+            embedded += store.store_chunk_vectors_batch(&model, &rows)?;
+        }
+        after_id = page.last().map(|(id, _)| *id).unwrap_or(after_id);
     }
     Ok(embedded)
 }
@@ -350,7 +372,7 @@ pub fn hybrid_search(store: &Store, query: &str, limit: usize) -> Result<Vec<Sea
     use std::collections::HashMap;
 
     let over = limit.saturating_mul(3).max(limit);
-    let keyword = crate::search::search(store, query, over, None)?;
+    let keyword = crate::search::search(store, query, over, None, None)?;
 
     // Semantic: score every chunk embedded by the *current* model, keep the best
     // chunk per session.
@@ -386,6 +408,7 @@ pub fn hybrid_search(store: &Store, query: &str, limit: usize) -> Result<Vec<Sea
             .into_iter()
             .map(|(_, c)| SearchHit {
                 session_id: c.session_id,
+                source: c.source,
                 title: c.title,
                 project: c.project,
                 line_no: 0,

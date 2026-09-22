@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SearchHit {
     pub session_id: String,
+    pub source: String,
     pub title: String,
     pub project: String,
     pub line_no: i64,
@@ -36,6 +37,7 @@ pub struct FileStat {
 pub struct SessionRef {
     pub pk: i64,
     pub session_id: String,
+    pub source: String,
     pub project_path: Option<String>,
     pub title: String,
 }
@@ -55,6 +57,7 @@ pub struct MessageRow {
 pub struct SessionBrief {
     pub pk: i64,
     pub session_id: String,
+    pub source: String,
     pub project_path: Option<String>,
     pub project_name: Option<String>,
     pub title: String,
@@ -66,6 +69,7 @@ pub struct SessionBrief {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkVec {
     pub session_id: String,
+    pub source: String,
     pub title: String,
     pub project: String,
     /// The chunk's own text (used as the result snippet).
@@ -121,6 +125,7 @@ pub struct WorktreeInfo {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ProseMessage {
     pub session_id: String,
+    pub source: String,
     pub project: String,
     pub title: String,
     pub ts: Option<i64>,
@@ -373,6 +378,20 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?)
     }
 
+    /// Session counts per source (`claude` / `codex` / `opencode`), for `doctor`.
+    pub fn session_counts_by_source(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(source_kind,'claude'), COUNT(*) FROM sessions
+             GROUP BY COALESCE(source_kind,'claude') ORDER BY 1",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Number of foreign-key violations (should always be 0).
     pub fn foreign_key_violations(&self) -> Result<usize> {
         let mut stmt = self.conn.prepare("PRAGMA foreign_key_check")?;
@@ -401,7 +420,7 @@ impl Store {
             .replace('_', "\\_");
         let pattern = format!("{escaped}%");
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, project_path, COALESCE(title,'')
+            "SELECT id, session_id, COALESCE(source_kind,'claude'), project_path, COALESCE(title,'')
              FROM sessions WHERE session_id LIKE ?1 ESCAPE '\\'
              ORDER BY last_ts DESC NULLS LAST LIMIT ?2",
         )?;
@@ -409,8 +428,9 @@ impl Store {
             Ok(SessionRef {
                 pk: r.get(0)?,
                 session_id: r.get(1)?,
-                project_path: r.get(2)?,
-                title: r.get(3)?,
+                source: r.get(2)?,
+                project_path: r.get(3)?,
+                title: r.get(4)?,
             })
         })?;
         let mut out = Vec::new();
@@ -422,19 +442,33 @@ impl Store {
 
     /// Raw title/alias search over `sessions_fts` (best-first). One row per
     /// session already (titles are session-level). `line_no` is 0.
-    pub fn search_titles_raw(&self, match_query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''),
+    pub fn search_titles_raw(
+        &self,
+        match_query: &str,
+        limit: usize,
+        source: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
+        let source_clause = if source.is_some() {
+            " AND s.source_kind = ?3"
+        } else {
+            ""
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.session_id, COALESCE(s.source_kind,'claude'), COALESCE(s.title,''), COALESCE(s.project_name,''),
                     0 AS line_no,
                     snippet(sessions_fts, 0, '[', ']', '…', 12),
                     bm25(sessions_fts) AS rank
              FROM sessions_fts
              JOIN sessions s ON s.id = sessions_fts.rowid
-             WHERE sessions_fts MATCH ?1
+             WHERE sessions_fts MATCH ?1{source_clause}
              ORDER BY rank
              LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![match_query, limit as i64], hit_from_row)?;
+        ))?;
+        let map = hit_from_row;
+        let rows = match source {
+            Some(source) => stmt.query_map(params![match_query, limit as i64, source], map)?,
+            None => stmt.query_map(params![match_query, limit as i64], map)?,
+        };
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -530,40 +564,64 @@ impl Store {
     /// (`is_sidechain`) and no bracketed system/attachment markers (`[request
     /// interrupted…]`, `[image: …]`). First block is text, no tool results /
     /// system reminders (`<…>`) / slash commands (`/…`). `limit` caps the total;
-    /// `None` dumps everything.
+    /// `None` dumps everything. `source` restricts to one agent product.
+    /// `tail` returns the *last* `limit` messages (newest) instead of the
+    /// first — still displayed oldest-first; requires `limit` to mean anything.
     pub fn list_prose_messages(
         &self,
         role: &str,
         limit: Option<usize>,
+        source: Option<&str>,
+        tail: bool,
     ) -> Result<Vec<ProseMessage>> {
+        let order = if tail {
+            "ORDER BY s.first_ts DESC NULLS LAST, s.id DESC, m.line_no DESC"
+        } else {
+            "ORDER BY s.first_ts, s.id, m.line_no"
+        };
         let limit_clause = if limit.is_some() { " LIMIT ?2" } else { "" };
+        // Positional params by hand: role ?1, LIMIT ?2 (when present), then the
+        // optional source filter takes the next free number.
+        let source_idx = if limit.is_some() { 3 } else { 2 };
+        let source_clause = if source.is_some() {
+            format!(" AND s.source_kind = ?{source_idx}")
+        } else {
+            String::new()
+        };
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT s.session_id, COALESCE(s.project_name,''), COALESCE(s.title,''),
+            "SELECT s.session_id, COALESCE(s.source_kind,'claude'), COALESCE(s.project_name,''), COALESCE(s.title,''),
                     m.ts, m.line_no, m.text_for_fts
              FROM messages m JOIN sessions s ON s.id = m.session_fk
              WHERE m.role = ?1 AND m.text_for_fts <> '' AND m.is_sidechain = 0
                AND m.content_json LIKE '[{{\"kind\":\"text\"%'
                AND m.text_for_fts NOT LIKE '<%' AND m.text_for_fts NOT LIKE '/%'
-               AND m.text_for_fts NOT LIKE '[%'
-             ORDER BY s.first_ts, s.id, m.line_no{limit_clause}"
+               AND m.text_for_fts NOT LIKE '[%'{source_clause}
+             {order}{limit_clause}"
         ))?;
         let map = |r: &rusqlite::Row| {
             Ok(ProseMessage {
                 session_id: r.get(0)?,
-                project: r.get(1)?,
-                title: r.get(2)?,
-                ts: r.get(3)?,
-                line_no: r.get(4)?,
-                text: r.get(5)?,
+                source: r.get(1)?,
+                project: r.get(2)?,
+                title: r.get(3)?,
+                ts: r.get(4)?,
+                line_no: r.get(5)?,
+                text: r.get(6)?,
             })
         };
-        let rows = match limit {
-            Some(n) => stmt.query_map(params![role, n as i64], map)?,
-            None => stmt.query_map(params![role], map)?,
+        let rows = match (limit, source) {
+            (Some(n), Some(source)) => stmt.query_map(params![role, n as i64, source], map)?,
+            (Some(n), None) => stmt.query_map(params![role, n as i64], map)?,
+            (None, Some(source)) => stmt.query_map(params![role, source], map)?,
+            (None, None) => stmt.query_map(params![role], map)?,
         };
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        if tail {
+            // The query ran newest-first for the LIMIT; restore flow order.
+            out.reverse();
         }
         Ok(out)
     }
@@ -697,18 +755,55 @@ impl Store {
     /// `kind` filters to one chunk kind; `None` means every kind, which is what
     /// the backfill wants — miss it and one kind is never embedded and never
     /// costed.
+    ///
+    /// Loads every pending row at once: only use this when the caller knows the
+    /// backlog is small (tests, estimates). The backfill must use
+    /// [`Self::chunks_needing_vectors_after`] and page through, or a 78k-chunk
+    /// backlog sits in RAM next to the ONNX arenas.
     pub fn chunks_needing_vectors(
         &self,
         model: &str,
         kind: Option<&str>,
     ) -> Result<Vec<(i64, String)>> {
+        self.chunks_needing_vectors_after(model, kind, 0, usize::MAX)
+    }
+
+    /// How many chunks still need an embedding under `model` (`None` = every
+    /// kind). For pre-flight estimates — counts without loading any text.
+    pub fn chunks_needing_vectors_count(&self, model: &str, kind: Option<&str>) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks c
+             LEFT JOIN chunk_vectors v ON v.chunk_fk = c.id
+             WHERE (v.chunk_fk IS NULL OR v.model IS NOT ?1)
+               AND (?2 IS NULL OR c.kind = ?2)",
+            params![model, kind],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// One page of chunks still needing an embedding: ids above `after_id`,
+    /// at most `limit` rows, oldest chunk first. Stable across resumes — a
+    /// kill + rerun continues where it stopped instead of reloading everything.
+    pub fn chunks_needing_vectors_after(
+        &self,
+        model: &str,
+        kind: Option<&str>,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
+        // SQLite treats a negative LIMIT as "no limit".
+        let lim: i64 = limit.try_into().unwrap_or(-1);
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.text FROM chunks c
              LEFT JOIN chunk_vectors v ON v.chunk_fk = c.id
              WHERE (v.chunk_fk IS NULL OR v.model IS NOT ?1)
-               AND (?2 IS NULL OR c.kind = ?2)",
+               AND (?2 IS NULL OR c.kind = ?2)
+               AND c.id > ?3
+             ORDER BY c.id LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![model, kind], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map(params![model, kind, after_id, lim], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -770,17 +865,18 @@ impl Store {
     /// it `wend search --semantic` would start returning situation text.
     pub fn all_chunk_vectors(&self, model: &str, kind: &str) -> Result<Vec<ChunkVec>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''), c.text, v.vec
+            "SELECT s.session_id, COALESCE(s.source_kind,'claude'), COALESCE(s.title,''), COALESCE(s.project_name,''), c.text, v.vec
              FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_fk JOIN sessions s ON s.id=c.session_fk
              WHERE v.model IS ?1 AND c.kind = ?2",
         )?;
         let rows = stmt.query_map(params![model, kind], |r| {
-            let blob: Vec<u8> = r.get(4)?;
+            let blob: Vec<u8> = r.get(5)?;
             Ok(ChunkVec {
                 session_id: r.get(0)?,
-                title: r.get(1)?,
-                project: r.get(2)?,
-                text: r.get(3)?,
+                source: r.get(1)?,
+                title: r.get(2)?,
+                project: r.get(3)?,
+                text: r.get(4)?,
                 vec: bytes_to_f32(&blob),
             })
         })?;
@@ -794,7 +890,7 @@ impl Store {
     /// All sessions as lightweight summaries (most recent first) for topology.
     pub fn all_sessions(&self) -> Result<Vec<SessionBrief>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, project_path, project_name, COALESCE(title,''),
+            "SELECT id, session_id, COALESCE(source_kind,'claude'), project_path, project_name, COALESCE(title,''),
                     last_ts, COALESCE(message_count,0)
              FROM sessions ORDER BY last_ts DESC NULLS LAST",
         )?;
@@ -802,11 +898,12 @@ impl Store {
             Ok(SessionBrief {
                 pk: r.get(0)?,
                 session_id: r.get(1)?,
-                project_path: r.get(2)?,
-                project_name: r.get(3)?,
-                title: r.get(4)?,
-                last_ts: r.get(5)?,
-                message_count: r.get(6)?,
+                source: r.get(2)?,
+                project_path: r.get(3)?,
+                project_name: r.get(4)?,
+                title: r.get(5)?,
+                last_ts: r.get(6)?,
+                message_count: r.get(7)?,
             })
         })?;
         let mut out = Vec::new();
@@ -884,27 +981,44 @@ impl Store {
         match_query: &str,
         limit: usize,
         role: Option<&str>,
+        source: Option<&str>,
     ) -> Result<Vec<SearchHit>> {
+        // Positional params are numbered by hand: MATCH ?1, LIMIT ?2, then the
+        // optional filters in a fixed order (role ?3, source ?3/?4).
         let role_clause = if role.is_some() {
             " AND m.role = ?3"
         } else {
             ""
         };
+        let source_clause = match (role, source) {
+            (_, None) => String::new(),
+            (Some(_), Some(_)) => " AND s.source_kind = ?4".to_string(),
+            (None, Some(_)) => " AND s.source_kind = ?3".to_string(),
+        };
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT s.session_id, COALESCE(s.title,''), COALESCE(s.project_name,''),
+            "SELECT s.session_id, COALESCE(s.source_kind,'claude'), COALESCE(s.title,''), COALESCE(s.project_name,''),
                     m.line_no,
                     snippet(messages_fts, 0, '[', ']', '…', 12),
                     bm25(messages_fts) AS rank
              FROM messages_fts
              JOIN messages m ON m.id = messages_fts.rowid
              JOIN sessions s ON s.id = m.session_fk
-             WHERE messages_fts MATCH ?1{role_clause}
+             WHERE messages_fts MATCH ?1{role_clause}{source_clause}
              ORDER BY rank
              LIMIT ?2"
         ))?;
-        let rows = match role {
-            Some(role) => stmt.query_map(params![match_query, limit as i64, role], hit_from_row)?,
-            None => stmt.query_map(params![match_query, limit as i64], hit_from_row)?,
+        let rows = match (role, source) {
+            (Some(role), Some(source)) => stmt.query_map(
+                params![match_query, limit as i64, role, source],
+                hit_from_row,
+            )?,
+            (Some(role), None) => {
+                stmt.query_map(params![match_query, limit as i64, role], hit_from_row)?
+            }
+            (None, Some(source)) => {
+                stmt.query_map(params![match_query, limit as i64, source], hit_from_row)?
+            }
+            (None, None) => stmt.query_map(params![match_query, limit as i64], hit_from_row)?,
         };
         let mut hits = Vec::new();
         for row in rows {
@@ -921,11 +1035,12 @@ pub const PARSER_VERSION: i64 = 1;
 fn hit_from_row(r: &rusqlite::Row) -> rusqlite::Result<SearchHit> {
     Ok(SearchHit {
         session_id: r.get(0)?,
-        title: r.get(1)?,
-        project: r.get(2)?,
-        line_no: r.get(3)?,
-        snippet: r.get(4)?,
-        rank: r.get(5)?,
+        source: r.get(1)?,
+        title: r.get(2)?,
+        project: r.get(3)?,
+        line_no: r.get(4)?,
+        snippet: r.get(5)?,
+        rank: r.get(6)?,
     })
 }
 
