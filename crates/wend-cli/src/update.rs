@@ -384,7 +384,9 @@ fn sha256_of(archive: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fetch_latest_parsing, install_to, is_newer_version, Release};
+    use super::{fetch_latest_parsing, is_newer_version};
+    #[cfg(unix)]
+    use super::{install_to, Release};
 
     #[test]
     fn newer_compares_segment_by_segment() {
