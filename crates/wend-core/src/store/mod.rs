@@ -969,7 +969,7 @@ impl Store {
 
     /// Raw keyword search: message-level hits ordered best-first (bm25 asc).
     /// `match_query` must already be a valid FTS5 query string (use
-    /// [`crate::search::compile_query`]). Grouping to one-per-session happens in
+    /// [`crate::search::compile_any_query`]). Grouping to one-per-session happens in
     /// [`crate::search::search`] — FTS5 aux functions can't be nested in SQL
     /// aggregates, so dedup is done in Rust over this ordered stream.
     /// `role`, when set (`"user"` / `"assistant"`), restricts hits to messages

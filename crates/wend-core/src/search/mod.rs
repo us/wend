@@ -2,15 +2,26 @@
 //!
 //! User text must never reach `MATCH` raw — quotes, `-`, `:`, `*`, `()` and the
 //! `AND/OR/NOT` keywords would error or silently change semantics. We quote each
-//! whitespace-separated term (doubling embedded quotes), which ANDs the terms and
-//! treats every token as a literal.
+//! whitespace-separated term (doubling embedded quotes) so every token is a
+//! literal, then join the terms with AND (titles) or OR (message bodies).
 
 use crate::error::Result;
 use crate::store::{SearchHit, Store};
 
-/// Compile free-text input into a safe FTS5 MATCH string. Returns `None` if the
-/// input has no searchable terms.
+/// Compile free-text input into a safe FTS5 MATCH string where every term must
+/// appear (AND). Returns `None` if the input has no searchable terms.
 pub fn compile_query(input: &str) -> Option<String> {
+    join_terms(input, " ")
+}
+
+/// Like [`compile_query`], but any term may appear (OR); bm25 still ranks
+/// messages that hold more, and rarer, terms first. A natural-language query
+/// rarely has all its words in one message, so AND returns nothing for it.
+pub fn compile_any_query(input: &str) -> Option<String> {
+    join_terms(input, " OR ")
+}
+
+fn join_terms(input: &str, sep: &str) -> Option<String> {
     let terms: Vec<String> = input
         .split_whitespace()
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
@@ -18,7 +29,7 @@ pub fn compile_query(input: &str) -> Option<String> {
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" "))
+        Some(terms.join(sep))
     }
 }
 
@@ -35,18 +46,19 @@ pub fn search(
     role: Option<&str>,
     source: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
-    let Some(match_query) = compile_query(query) else {
+    let (Some(all_terms), Some(any_term)) = (compile_query(query), compile_any_query(query)) else {
         return Ok(Vec::new());
     };
     // Tiered merge (corpus-size-independent): title/alias matches first — that's
     // a strong signal and `name`'s whole purpose — then message-body matches,
-    // best-first. Dedup to one result per session. (A fixed additive bm25 boost
+    // best-first. Titles need every term (OR would float any title holding one
+    // common word to the top); bodies need any term, ranked by bm25. Dedup to one result per session. (A fixed additive bm25 boost
     // is fragile because body/title bm25 scales diverge as the corpus grows.)
     let mut seen = std::collections::HashSet::new();
     let mut grouped = Vec::with_capacity(limit);
 
     if role.is_none() {
-        for hit in store.search_titles_raw(&match_query, limit, source)? {
+        for hit in store.search_titles_raw(&all_terms, limit, source)? {
             if seen.insert(hit.session_id.clone()) {
                 grouped.push(hit);
                 if grouped.len() >= limit {
@@ -61,7 +73,7 @@ pub fn search(
     // let min>max (a `clamp(limit, CAP)` panics when limit>CAP).
     const RAW_CAP: usize = 50_000;
     let raw_limit = limit.saturating_mul(20).max(limit).min(RAW_CAP);
-    for hit in store.search_raw(&match_query, raw_limit, role, source)? {
+    for hit in store.search_raw(&any_term, raw_limit, role, source)? {
         if seen.insert(hit.session_id.clone()) {
             grouped.push(hit);
             if grouped.len() >= limit {
@@ -95,7 +107,16 @@ mod tests {
     }
 
     #[test]
+    fn any_query_ors_quoted_terms() {
+        assert_eq!(
+            compile_any_query("foo OR bar").as_deref(),
+            Some("\"foo\" OR \"OR\" OR \"bar\"")
+        );
+    }
+
+    #[test]
     fn empty_query_is_none() {
         assert_eq!(compile_query("   "), None);
+        assert_eq!(compile_any_query("   "), None);
     }
 }
