@@ -75,14 +75,20 @@ things were measured, and they are not interchangeable:
 |---|---:|
 | Azure `text-embedding-3-large` @1024 | 0.771 |
 | local `multilingual-e5-small` @384 | 0.381 |
-| keyword only | 0.000 |
+| keyword, every term required (old AND behaviour) | 0.000 |
 
 **End to end** (`wend search --semantic` against the whole index, does the exact
-session you meant come back): top-1 24%, top-5 50%, top-10 56%, MRR 0.350 — versus
-**0.000 for keyword search**, which returns nothing at all for a natural-language
-query because every term is ANDed together. The end-to-end number is lower
-because picking one session out of 757 is much harder than picking one message
-out of 500, and because many sessions are genuinely about the same topic.
+session you meant come back): top-1 24%, top-5 50%, top-10 56%, MRR 0.350. The
+end-to-end number is lower because picking one session out of 757 is much harder
+than picking one message out of 500, and because many sessions are genuinely about
+the same topic.
+
+**Plain keyword search** needs no model and no network. It matches message bodies
+on any query term and lets BM25 rank messages holding more, and rarer, terms
+first; titles still need every term. Re-run on the same queries (31 of the 34
+whose targets could be located again) against a larger 5,226-session index:
+top-1 19%, top-5 26%, top-10 45%, MRR 0.246, 146 ms median per `wend search`
+call. Before that change it required every term in one message and scored 0.000.
 
 Your numbers will differ. The harness is in `plans/`.
 
@@ -116,7 +122,7 @@ incrementally.
 ## Use
 
 ```bash
-wend search "rust sqlite fts"           # keyword (BM25, stemmed, session-grouped)
+wend search "rust sqlite fts"           # keyword (any term, BM25-ranked, stemmed, session-grouped)
 wend search "fixing a crash" --semantic # meaning-based (hybrid keyword+vector); needs --features semantic build
 wend search "auth bug" --json           # machine-readable (for scripts/skills)
 wend search "auth" --source codex       # only one source: claude | codex | opencode

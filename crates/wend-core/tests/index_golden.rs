@@ -47,6 +47,10 @@ fn indexes_fixture_and_search_finds_it() {
     assert!(!hits.is_empty(), "expected a match for 'gradient'");
     assert!(hits.iter().any(|h| h.session_id == "basic_session"));
 
+    // a query whose words don't all appear in one message still finds it
+    let loose = search(&store, "gradient unrelatedword", 10, None, None).unwrap();
+    assert!(loose.iter().any(|h| h.session_id == "basic_session"));
+
     // thinking text must not be searchable
     let secret = search(&store, "private reasoning", 10, None, None).unwrap();
     assert!(secret.is_empty(), "thinking blocks must not be indexed");

@@ -3,9 +3,10 @@
 //! The indexed path (`search`) needs `wend index` first and ranks with BM25.
 //! This path needs nothing: it discovers the session files, parses them with
 //! the same parser the indexer uses, and matches whitespace-separated terms
-//! case-insensitively (all terms must appear — the same AND semantics as
-//! `search::compile_query`, minus stemming). One hit per session, newest
-//! session first. Slower than FTS on a huge corpus, instant to use.
+//! case-insensitively (all terms must appear, as in `search::compile_query`,
+//! minus stemming; the indexed path ORs terms because bm25 ranks them, and this
+//! path has no ranking). One hit per session, newest session first. Slower than
+//! FTS on a huge corpus, instant to use.
 
 use crate::error::Result;
 use crate::index::{
