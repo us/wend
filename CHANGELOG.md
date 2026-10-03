@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/us/wend/compare/v0.2.0...v0.3.0) (2026-10-03)
+
+
+### Features
+
+* **search:** match any query term in message bodies ([144f9c5](https://github.com/us/wend/commit/144f9c5af91539ce95770afb0c0c9ff8c22d0781))
+
 ## [0.2.0](https://github.com/us/wend/compare/v0.1.0...v0.2.0) (2026-09-30)
 
 
