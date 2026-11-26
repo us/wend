@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One keyword-search result row (message-level; grouped to sessions in search step).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SearchHit {
     pub session_id: String,
     pub source: String,
@@ -33,7 +33,7 @@ pub struct FileStat {
 }
 
 /// A resolved session reference (for show/resume/name/export).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionRef {
     pub pk: i64,
     pub session_id: String,
@@ -43,7 +43,7 @@ pub struct SessionRef {
 }
 
 /// A stored message row, for rendering a transcript.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MessageRow {
     pub line_no: i64,
     pub rec_type: String,
@@ -407,6 +407,34 @@ impl Store {
             [],
         )?;
         Ok(())
+    }
+
+    /// The transcript path a session was indexed from.
+    pub fn session_file_path(&self, session_pk: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT file_path FROM sessions WHERE id=?1",
+                params![session_pk],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Remove every row indexed from one transcript file (the inverse of
+    /// [`Store::replace_session`]). Returns whether a session existed.
+    pub fn delete_session_file(&mut self, file_path: &str) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
+            "DELETE FROM sessions WHERE file_path=?1",
+            params![file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM relations WHERE source_path=?1",
+            params![file_path],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
     }
 
     /// Find sessions whose id starts with `id_prefix` (most recent first).

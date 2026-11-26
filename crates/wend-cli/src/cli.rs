@@ -94,6 +94,9 @@ pub enum Command {
         /// Max results.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Search your synced history in wend cloud instead of the local index.
+        #[arg(long)]
+        cloud: bool,
     },
     /// Find how you reacted in similar past situations.
     ///
@@ -165,6 +168,9 @@ pub enum Command {
         /// Print only the message count, nothing else.
         #[arg(long)]
         count: bool,
+        /// Read the session from wend cloud instead of the local index.
+        #[arg(long)]
+        cloud: bool,
     },
     /// Show the worktree/subagent topology for a project.
     Tree {
@@ -175,6 +181,37 @@ pub enum Command {
     Resume {
         /// Session id (short UUID prefix accepted).
         id: String,
+        /// Take the session from wend cloud, downloading it here first if this
+        /// machine does not have it.
+        #[arg(long)]
+        cloud: bool,
+        /// With --cloud: the local checkout to resume in, when the session's
+        /// original directory does not exist on this machine.
+        #[arg(long, requires = "cloud")]
+        cwd: Option<std::path::PathBuf>,
+    },
+    /// Connect this machine to wend cloud with a one-time enrollment token.
+    Login {
+        /// Enrollment token (or set WEND_ENROLL_TOKEN, or pipe it on stdin).
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        enroll: Option<String>,
+        /// Server URL (https; plain http only for localhost).
+        #[arg(long)]
+        server: Option<String>,
+        /// Name shown for this device in the device list.
+        #[arg(long)]
+        device_name: Option<String>,
+    },
+    /// Disconnect this machine from wend cloud (revokes its token).
+    Logout,
+    /// Scrub secrets from your Claude Code and Codex transcripts and upload them to wend cloud.
+    Sync {
+        /// Show what would be redacted and uploaded; upload nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the first-sync confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// Export a session to a file.
     Export {

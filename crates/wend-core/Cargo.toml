@@ -10,12 +10,18 @@ rust-version.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# preserve_order: a scrubbed transcript line keeps its key order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 chrono.workspace = true
 rusqlite.workspace = true
 etcetera.workspace = true
 rayon.workspace = true
 tracing.workspace = true
+# Secret scrubbing (always on): gitleaks rules run through regex with an
+# Aho-Corasick keyword prefilter; base64 decodes candidate strings.
+regex = "1"
+aho-corasick = "1"
+base64 = "0.22"
 
 # Optional: local semantic search via fastembed (ONNX Runtime). Opt-in because
 # it's heavy (model download, larger binary) and the keyword core needs none of it.
@@ -28,11 +34,10 @@ fastembed = { version = "5", optional = true }
 # already resolve in the lockfile through fastembed, so enabling both features
 # together pulls in no new crates. `regex` backs the outbound secret redaction.
 ureq = { version = "3", features = ["json"], optional = true }
-regex = { version = "1", optional = true }
 
 [features]
 semantic = ["dep:fastembed"]
-azure = ["dep:ureq", "dep:regex"]
+azure = ["dep:ureq"]
 
 [dev-dependencies]
 tempfile.workspace = true
