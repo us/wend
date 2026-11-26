@@ -55,6 +55,12 @@ Sources: ort linking docs / "bundling ONNX in Rust" (Nix/Docker pain) · fastemb
 - **Search at our scale:** ~300k × 384-d vectors (chunk-level; see IMPLEMENTATION §7 — vectors are keyed by chunk, not message). **ANN is unnecessary** — a brute-force cosine scan with `simsimd` (AVX2/AVX-512/NEON) is single-digit–to–tens of ms; int8 quantization (optional, later) can cut RAM ~4× / speed up scans. Exact recall, no index to build/maintain. (`hnsw_rs`, pure-Rust HNSW, is the documented fallback **only past ~1M vectors**.)
 - **Hybrid fusion:** **Reciprocal Rank Fusion, k = 60** — run BM25 and vector scans independently, score each result `1/(k + rank)`, sum per document. No score normalization needed (ranks unify BM25's and cosine's incomparable scales). Optional lexical/semantic weights as multipliers (start 1.0 / 0.7).
 - **Ranking polish:** composite = RRF × recency-decay (≈30-day half-life, cap +20%) × active-project boost; title/alias column weighted ≫ body.
+- **Recency rule (measured 2026-11-26, not yet implemented in code):**
+  - A user's own `search` and `resume`: recency decay with a **30-day half-life**, as above.
+  - Everywhere else: **no age penalty** until more data says otherwise.
+  - Why: on one heavy user's history, cross-session returns to the same edited file took p50 6.0 days and p90 21.1 days (n = 19); revisits to a file after a pause of at least 1 hour took p50 0.36 and p90 4.0 days (n = 965); returns of a day or more took p50 3.0 and p90 11.0 days (n = 250); a topic proxy (TF-IDF cosine of 0.3 or more between sessions' prompts) gave p50 0.9 and p90 6.1 days (n = 44). Under `0.5^(age / half_life)` a 21-day-old item keeps weight 0.61 at a 30-day half-life but only 0.12 at 7 days, so short half-lives would bury real returns.
+  - Limits: one person, many agents. The window was 36 days (2026-10-21 to 2026-11-26) because the default 30-day transcript sweep had deleted older history, so every p90 is a lower bound. File-level numbers are Claude Code only (the Codex and opencode stores held no file edits). The cross-session sample is small.
+  - Re-run at the **end of February 2027**, once the corpus covers more than 90 days.
 
 Sources: alexgarcia.xyz/sqlite-vec/rust · SimSIMD · Azure/ParadeDB RRF.
 

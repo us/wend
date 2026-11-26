@@ -15,6 +15,7 @@ pub mod model;
 pub mod parser;
 pub mod recap;
 pub mod recover;
+pub mod scrub;
 pub mod search;
 pub mod store;
 pub mod topology;

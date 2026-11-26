@@ -22,6 +22,15 @@ pub fn index_db_path() -> Result<PathBuf> {
     Ok(app_strategy()?.data_dir().join("index.db"))
 }
 
+/// The cloud login (`…/wend/credentials.json`, created `0600`). Override with
+/// `WEND_CREDENTIALS`.
+pub fn credentials_path() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("WEND_CREDENTIALS") {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(app_strategy()?.config_dir().join("credentials.json"))
+}
+
 /// Directory for cached embedding models. Override with `WEND_MODEL_CACHE`.
 pub fn model_cache_dir() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("WEND_MODEL_CACHE") {

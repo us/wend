@@ -1,6 +1,7 @@
 //! wend CLI entry point.
 
 mod cli;
+mod cloud;
 mod render;
 mod update;
 
@@ -19,7 +20,16 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");
-            std::process::ExitCode::FAILURE
+            // Cloud trouble (unreachable, HTTP error) exits 2, like a clap
+            // usage error; any other failure exits 1.
+            let cloud = err.chain().any(|e| {
+                e.is::<cloud::ServerError>() || e.to_string().starts_with("wend cloud unreachable")
+            });
+            if cloud {
+                std::process::ExitCode::from(2)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
         }
     }
 }
@@ -71,9 +81,28 @@ fn run(args: Cli) -> Result<()> {
             source,
             live,
             limit,
+            cloud,
         } => {
             let role = role.map(|r| r.as_db_str());
             let source = source.map(|s| s.as_db_str());
+            if cloud {
+                if semantic || live || source == Some("opencode") {
+                    anyhow::bail!("--cloud searches Claude Code and Codex by keyword; --semantic, --live and --source opencode are not available with it yet");
+                }
+                let client = cloud::Client::load()?;
+                let hits = cloud::search(&client, &query, limit, role, source)?;
+                if json {
+                    println!("{}", serde_json::to_string(&hits)?);
+                    return Ok(());
+                }
+                println!("{}", cloud::header(&client)?);
+                if hits.is_empty() {
+                    println!("no matches for {query:?}");
+                } else {
+                    print_hits(&hits);
+                }
+                return Ok(());
+            }
             if live {
                 if semantic {
                     anyhow::bail!(
@@ -135,22 +164,7 @@ fn run(args: Cli) -> Result<()> {
                     println!("no matches for {query:?}");
                 }
             } else {
-                for (i, h) in hits.iter().enumerate() {
-                    let title = if h.title.is_empty() {
-                        "(untitled)"
-                    } else {
-                        &h.title
-                    };
-                    println!(
-                        "{}. [{}|{}] {} · {}",
-                        i + 1,
-                        h.source,
-                        h.project,
-                        title,
-                        h.session_id
-                    );
-                    println!("    {}", h.snippet);
-                }
+                print_hits(&hits);
             }
             Ok(())
         }
@@ -297,7 +311,37 @@ fn run(args: Cli) -> Result<()> {
             tail,
             range,
             count,
+            cloud,
         } => {
+            if cloud {
+                if recovered {
+                    anyhow::bail!("--recovered is local only for now; run it without --cloud");
+                }
+                let client = cloud::Client::load()?;
+                let fetched = cloud::session(&client, &id)?;
+                let chunks: Vec<String> = fetched
+                    .messages
+                    .iter()
+                    .filter_map(|m| {
+                        render_message_chunk(&m.content_json, &m.role, &m.rec_type, false)
+                    })
+                    .collect();
+                if !count {
+                    println!("{}", cloud::header(&client)?);
+                }
+                return print_transcript(
+                    &fetched.session,
+                    chunks,
+                    None,
+                    false,
+                    Window {
+                        head,
+                        tail,
+                        range,
+                        count,
+                    },
+                );
+            }
             let store = open_store()?;
             let sess = resolve_or_report(&store, &id)?;
 
@@ -350,93 +394,52 @@ fn run(args: Cli) -> Result<()> {
                 }
             }
 
-            let total = chunks.len();
+            print_transcript(
+                &sess,
+                chunks,
+                header_extra,
+                recovered,
+                Window {
+                    head,
+                    tail,
+                    range,
+                    count,
+                },
+            )
+        }
 
-            // --count: just the number.
-            if count {
-                println!("{total}");
+        Command::Resume { id, cloud, cwd } => {
+            if cloud {
+                let client = cloud::Client::load()?;
+                let (sess, written) = cloud::resume(&client, &id, cwd.clone())?;
+                if let Some(path) = written {
+                    eprintln!(
+                        "downloaded from wend cloud to {} (redacted parts stay redacted)",
+                        path.display()
+                    );
+                }
+                let sess = SessionRef {
+                    project_path: cwd
+                        .map(|c| c.to_string_lossy().into_owned())
+                        .or(sess.project_path),
+                    ..sess
+                };
+                print_resume(&sess);
                 return Ok(());
             }
-
-            // Pick the window [start..end) (0-based). Priority: range > head >
-            // tail > a soft default cap so a huge session doesn't flood the term.
-            const DEFAULT_CAP: usize = 200;
-            let (start, end, note): (usize, usize, Option<String>) = if let Some(r) = &range {
-                let (a, b) = parse_range(r)?; // 1-based inclusive
-                let s = a.saturating_sub(1).min(total);
-                let e = b.min(total).max(s);
-                (s, e, Some(format!("messages {}–{} of {total}", s + 1, e)))
-            } else if let Some(n) = head {
-                let e = n.min(total);
-                (0, e, Some(format!("first {e} of {total}")))
-            } else if let Some(n) = tail {
-                let s = total.saturating_sub(n);
-                (s, total, Some(format!("last {} of {total}", total - s)))
-            } else if total > DEFAULT_CAP {
-                // --recovered: the hidden early history is what you want → from start.
-                if recovered {
-                    (
-                        0,
-                        DEFAULT_CAP,
-                        Some(format!("first {DEFAULT_CAP} of {total}")),
-                    )
-                } else {
-                    (
-                        total - DEFAULT_CAP,
-                        total,
-                        Some(format!("last {DEFAULT_CAP} of {total}")),
-                    )
-                }
-            } else {
-                (0, total, None)
-            };
-
-            let title = if sess.title.is_empty() {
-                "(untitled)"
-            } else {
-                &sess.title
-            };
-            println!("# {title}  [{}]", sess.session_id);
-            println!("  source: {}", sess.source);
-            if let Some(p) = &sess.project_path {
-                println!("  project: {p}");
-            }
-            println!("  {total} messages");
-            if let Some(h) = header_extra {
-                println!("{h}");
-            }
-            if let Some(note) = note {
-                println!("  showing {note}  (--head N / --tail N / --range A:B / --count, or `export` for all)");
-            }
-            for (i, c) in chunks[start..end].iter().enumerate() {
-                println!("\n[{}] {c}", start + i + 1);
-            }
-            Ok(())
-        }
-
-        Command::Resume { id } => {
             let store = open_store()?;
             let sess = resolve_or_report(&store, &id)?;
-            // Each agent resumes with its own CLI. The `cd` matters because the
-            // session is rooted in its original working directory.
-            let resume_cmd = match sess.source.as_str() {
-                "codex" => format!("codex resume {}", sess.session_id),
-                "opencode" => format!("opencode run --session {}", sess.session_id),
-                _ => format!("claude --resume {}", sess.session_id),
-            };
-            match &sess.project_path {
-                Some(cwd) => {
-                    if !std::path::Path::new(cwd).is_dir() {
-                        eprintln!(
-                            "warning: project dir no longer exists: {cwd} (the cd will fail — resume manually from another dir if needed)"
-                        );
-                    }
-                    println!("cd {} && {resume_cmd}", shell_quote(cwd));
-                }
-                None => println!("{resume_cmd}"),
-            }
+            print_resume(&sess);
             Ok(())
         }
+
+        Command::Login {
+            enroll,
+            server,
+            device_name,
+        } => cloud::login(enroll, server, device_name),
+        Command::Logout => cloud::logout(),
+        Command::Sync { dry_run, yes } => cloud::sync(dry_run, yes),
 
         Command::Name { id, alias } => {
             if alias.trim().is_empty() {
@@ -689,6 +692,134 @@ fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHi
 fn run_semantic(store: &Store, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
     tracing::warn!("--semantic needs a build with --features semantic (or azure); keyword only");
     Ok(search::search(store, query, limit, None, None)?)
+}
+
+/// Print search hits (local and cloud share the format).
+fn print_hits(hits: &[SearchHit]) {
+    for (i, h) in hits.iter().enumerate() {
+        let title = if h.title.is_empty() {
+            "(untitled)"
+        } else {
+            &h.title
+        };
+        println!(
+            "{}. [{}|{}] {} · {}",
+            i + 1,
+            h.source,
+            h.project,
+            title,
+            h.session_id
+        );
+        println!("    {}", h.snippet);
+    }
+}
+
+/// Print the command that resumes a session in its own agent CLI.
+fn print_resume(sess: &SessionRef) {
+    // Each agent resumes with its own CLI. The `cd` matters because the
+    // session is rooted in its original working directory.
+    let resume_cmd = match sess.source.as_str() {
+        "codex" => format!("codex resume {}", sess.session_id),
+        "opencode" => format!("opencode run --session {}", sess.session_id),
+        _ => format!("claude --resume {}", sess.session_id),
+    };
+    match &sess.project_path {
+        Some(cwd) => {
+            if !std::path::Path::new(cwd).is_dir() {
+                eprintln!(
+                    "warning: project dir no longer exists: {cwd} (the cd will fail; resume manually from another dir if needed)"
+                );
+            }
+            println!("cd {} && {resume_cmd}", shell_quote(cwd));
+        }
+        None => println!("{resume_cmd}"),
+    }
+}
+
+/// Which part of a transcript `show` prints.
+struct Window {
+    head: Option<usize>,
+    tail: Option<usize>,
+    range: Option<String>,
+    count: bool,
+}
+
+/// Print a session header and the chosen window of its rendered messages.
+fn print_transcript(
+    sess: &SessionRef,
+    chunks: Vec<String>,
+    header_extra: Option<String>,
+    recovered: bool,
+    w: Window,
+) -> Result<()> {
+    let total = chunks.len();
+
+    // --count: just the number.
+    if w.count {
+        println!("{total}");
+        return Ok(());
+    }
+
+    // Pick the window [start..end) (0-based). Priority: range > head >
+    // tail > a soft default cap so a huge session doesn't flood the term.
+    const DEFAULT_CAP: usize = 200;
+    let (start, end, note): (usize, usize, Option<String>) = if let Some(r) = &w.range {
+        let (a, b) = parse_range(r)?; // 1-based inclusive
+        let s = a.saturating_sub(1).min(total);
+        let e = b.min(total).max(s);
+        (
+            s,
+            e,
+            Some(format!("messages {} to {} of {total}", s + 1, e)),
+        )
+    } else if let Some(n) = w.head {
+        let e = n.min(total);
+        (0, e, Some(format!("first {e} of {total}")))
+    } else if let Some(n) = w.tail {
+        let s = total.saturating_sub(n);
+        (s, total, Some(format!("last {} of {total}", total - s)))
+    } else if total > DEFAULT_CAP {
+        // --recovered: the hidden early history is what you want → from start.
+        if recovered {
+            (
+                0,
+                DEFAULT_CAP,
+                Some(format!("first {DEFAULT_CAP} of {total}")),
+            )
+        } else {
+            (
+                total - DEFAULT_CAP,
+                total,
+                Some(format!("last {DEFAULT_CAP} of {total}")),
+            )
+        }
+    } else {
+        (0, total, None)
+    };
+
+    let title = if sess.title.is_empty() {
+        "(untitled)"
+    } else {
+        &sess.title
+    };
+    println!("# {title}  [{}]", sess.session_id);
+    println!("  source: {}", sess.source);
+    if let Some(p) = &sess.project_path {
+        println!("  project: {p}");
+    }
+    println!("  {total} messages");
+    if let Some(h) = header_extra {
+        println!("{h}");
+    }
+    if let Some(note) = note {
+        println!(
+            "  showing {note}  (--head N / --tail N / --range A:B / --count, or `export` for all)"
+        );
+    }
+    for (i, c) in chunks[start..end].iter().enumerate() {
+        println!("\n[{}] {c}", start + i + 1);
+    }
+    Ok(())
 }
 
 /// Resolve a short session-id prefix to exactly one session, or report candidates.

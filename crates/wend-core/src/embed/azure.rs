@@ -10,10 +10,8 @@
 //! hard requirement and what it can and cannot promise.
 
 use crate::error::{Error, Result};
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Output dimensionality requested from the model.
@@ -472,105 +470,12 @@ impl Reranker {
 /// it cannot promise that no secret ever leaves. Anything truly sensitive should
 /// not be in the transcripts in the first place.
 pub fn redact(s: &str) -> String {
-    static RULES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-    let rules = RULES.get_or_init(|| {
-        let r = |p: &str| Regex::new(p).expect("static redaction pattern must compile");
-        vec![
-            // A private key body runs to the end of its chunk...
-            (
-                r(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*"),
-                "<redacted:private-key>",
-            ),
-            // ...and in the chunk holding only its tail, back to the start.
-            (
-                r(r"(?s)^.*?-----END [A-Z ]*PRIVATE KEY-----"),
-                "<redacted:private-key>",
-            ),
-            // Middle chunks are bare base64 lines with no marker at all.
-            (r(r"(?m)^[A-Za-z0-9+/=]{64,}$"), "<redacted:base64>"),
-            (r(r"AKIA[0-9A-Z]{16}"), "<redacted:aws-key>"),
-            (r(r"\bsk-[A-Za-z0-9_\-]{16,}"), "<redacted:api-key>"),
-            (
-                r(r"\b[rp]k_(live|test)_[A-Za-z0-9]{10,}"),
-                "<redacted:api-key>",
-            ),
-            // Vendor tokens that are all "known prefix + long opaque string".
-            // GitHub and npm tokens were found in this corpus unredacted by the
-            // rules above; the rest ride along for one regex.
-            (
-                r(r"\b(gh[pousr]_|github_pat_|glpat-|npm_|xox[baprs]-|AIza|SG\.)[A-Za-z0-9_\-\.]{20,}"),
-                "<redacted:api-key>",
-            ),
-            // A JWT with no `Bearer` in front of it — the rule below only fires
-            // on the header form, and Supabase/Auth0 tokens get pasted bare.
-            (
-                r(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
-                "<redacted:jwt>",
-            ),
-            (
-                r(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]{20,}=*"),
-                "<redacted:bearer>",
-            ),
-            (r(r"://[^\s:/@]+:[^\s@/]+@"), "://<redacted:creds>@"),
-            (
-                r(r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY)[A-Z0-9_]*)\s*[:=]\s*\S+"),
-                "$1=<redacted>",
-            ),
-        ]
-    });
-
-    let mut out = s.to_string();
-    for (re, replacement) in rules {
-        out = re.replace_all(&out, *replacement).into_owned();
-    }
-    out
+    crate::scrub::text(s).0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn redacts_the_shapes_found_in_real_transcripts() {
-        let cases = [
-            "here is AKIA1234567890ABCDEF ok",
-            "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz012345",
-            "curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc'",
-            "postgres://admin:hunter2@db.example.com:5432/app",
-            "DATABASE_PASSWORD: s3cr3t-value",
-            "STRIPE=pk_live_51ABCdefGHIjkl",
-            // Found unredacted in a real corpus before these rules were added.
-            "gh repo clone with ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
-            "//registry.npmjs.org/:_authToken=npm_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
-            "anon key eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
-        ];
-        for c in cases {
-            let out = redact(c);
-            assert!(out.contains("<redacted"), "not redacted: {c} -> {out}");
-        }
-        assert!(!redact(cases[0]).contains("AKIA1234567890ABCDEF"));
-        assert!(!redact(cases[3]).contains("hunter2"));
-    }
-
-    /// A key split across chunks must be caught in every piece, including the
-    /// tail chunk that holds only the closing marker.
-    #[test]
-    fn redacts_pem_fragments_without_both_markers() {
-        let head = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow0BAQEFAASCAmVeryLongBase64";
-        let middle = "d0VeryLongBase64Line".repeat(4); // ≥64 chars, no marker
-        let tail = "shortTail==\n-----END RSA PRIVATE KEY-----";
-
-        assert!(!redact(head).contains("MIIEow"));
-        assert!(!redact(&middle).contains("VeryLongBase64Line"));
-        let t = redact(tail);
-        assert!(!t.contains("shortTail"), "tail fragment leaked: {t}");
-    }
-
-    #[test]
-    fn ordinary_prose_survives_redaction() {
-        let s = "dostum bu embedding modelini nasil degistirebiliriz acaba?";
-        assert_eq!(redact(s), s);
-    }
 
     /// The rule that protects a paid-for index: all three or none, never a
     /// quiet fallback to the local backend on a partial configuration.
