@@ -195,7 +195,7 @@ pub enum Command {
         /// Enrollment token (or set WEND_ENROLL_TOKEN, or pipe it on stdin).
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         enroll: Option<String>,
-        /// Server URL (https; plain http only for localhost).
+        /// Server URL you were given (https; plain http only for localhost).
         #[arg(long)]
         server: Option<String>,
         /// Name shown for this device in the device list.

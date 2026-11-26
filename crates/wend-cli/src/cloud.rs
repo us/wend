@@ -15,8 +15,6 @@ use wend_core::scrub::{Format, Scrubber, RULESET_VERSION};
 use wend_core::store::{MessageRow, SearchHit, SessionRef};
 use wend_core::{config, index};
 
-/// Where `wend login` connects when `--server` is not given.
-pub const DEFAULT_SERVER: &str = "https://cloud.wend.dev";
 /// The server refuses bigger uploads.
 const MAX_UPLOAD: usize = 64 << 20;
 /// The server refuses transcripts that decompress to more than this.
@@ -84,16 +82,14 @@ fn check_server(url: &str) -> Result<String> {
     }
 }
 
-/// Server and token from the environment, if any. `WEND_SERVER` alone is
-/// refused, so an environment variable can never redirect the stored token.
+/// Server and token from the environment, if any. They only work as a pair:
+/// `WEND_SERVER` alone could redirect the stored token, `WEND_TOKEN` alone
+/// would have no server to go to.
 fn from_env(token: Option<String>, server: Option<String>) -> Result<Option<(String, String)>> {
     match (token, server) {
-        (Some(token), server) => Ok(Some((
-            server.unwrap_or_else(|| DEFAULT_SERVER.into()),
-            token,
-        ))),
-        (None, Some(_)) => bail!("WEND_SERVER is only honoured together with WEND_TOKEN"),
+        (Some(token), Some(server)) => Ok(Some((server, token))),
         (None, None) => Ok(None),
+        _ => bail!("WEND_TOKEN and WEND_SERVER must be set together"),
     }
 }
 
@@ -227,7 +223,10 @@ pub fn login(
     if token.is_empty() {
         bail!("no enrollment token given (argument, WEND_ENROLL_TOKEN, or stdin)");
     }
-    let server = check_server(server.as_deref().unwrap_or(DEFAULT_SERVER))?;
+    let server =
+        check_server(server.as_deref().ok_or_else(|| {
+            anyhow!("pass --server <url> (the wend cloud address you were given)")
+        })?)?;
     let device_name = device_name.unwrap_or_else(default_device_name);
     let resp = agent()
         .post(format!("{server}/v1/enroll"))
@@ -962,14 +961,14 @@ mod tests {
 
     #[test]
     fn servers_need_https_except_localhost() {
-        assert!(check_server("https://cloud.wend.dev").is_ok());
+        assert!(check_server("https://cloud.example.com").is_ok());
         assert!(check_server("http://localhost:8787").is_ok());
         assert!(check_server("http://127.0.0.1:8787/").is_ok());
         assert!(check_server("http://evil.example").is_err());
         assert!(check_server("http://localhost.evil.example").is_err());
         assert!(check_server("http://localhost:80@evil.example/").is_err());
-        assert!(check_server("https://user:pw@cloud.wend.dev").is_err());
-        assert!(check_server("ftp://cloud.wend.dev").is_err());
+        assert!(check_server("https://user:pw@cloud.example.com").is_err());
+        assert!(check_server("ftp://cloud.example.com").is_err());
     }
 
     #[test]
@@ -1048,8 +1047,11 @@ mod tests {
     fn wend_server_alone_is_refused() {
         assert!(from_env(None, Some("https://evil.example".into())).is_err());
         assert_eq!(from_env(None, None).unwrap(), None);
-        let (server, token) = from_env(Some("t".into()), None).unwrap().unwrap();
-        assert_eq!((server.as_str(), token.as_str()), (DEFAULT_SERVER, "t"));
+        assert!(from_env(Some("t".into()), None).is_err());
+        let (server, token) = from_env(Some("t".into()), Some("https://s".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!((server.as_str(), token.as_str()), ("https://s", "t"));
     }
 
     #[test]
